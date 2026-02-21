@@ -18,7 +18,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [3/3] Building one-file Windows executable...
-py -m PyInstaller --clean --noconfirm --onefile --windowed --name SharedWhiteboard whiteboard_app.py
+py -m PyInstaller --clean --noconfirm --onefile --name SharedWhiteboard whiteboard_app.py
 if %errorlevel% neq 0 (
   echo [ERROR] Build failed.
   exit /b 1
@@ -27,4 +27,9 @@ if %errorlevel% neq 0 (
 echo.
 echo Build complete.
 echo EXE path: dist\SharedWhiteboard.exe
+echo.
+echo Run server on remote machine:
+echo   SharedWhiteboard.exe --server --host 0.0.0.0 --port 5050
+echo Run client on user machine:
+echo   SharedWhiteboard.exe --host SERVER_PUBLIC_IP --port 5050
 endlocal

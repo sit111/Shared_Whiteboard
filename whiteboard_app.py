@@ -1,3 +1,4 @@
+import argparse
 import json
 import socket
 import threading
@@ -15,7 +16,7 @@ class WhiteboardState:
     strokes: List[dict] = field(default_factory=list)
 
 
-class EmbeddedWhiteboardServer:
+class WhiteboardServer:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
@@ -35,10 +36,9 @@ class EmbeddedWhiteboardServer:
         self._server_socket.listen()
         self._running = True
 
-        threading.Thread(target=self._accept_loop, daemon=True).start()
+        print(f"Whiteboard server listening on {self.host}:{self.port}")
 
-    def _accept_loop(self) -> None:
-        while self._running and self._server_socket:
+        while self._running:
             try:
                 client_socket, address = self._server_socket.accept()
             except OSError:
@@ -55,7 +55,7 @@ class EmbeddedWhiteboardServer:
         try:
             self._send(client_socket, {'type': 'sync', 'strokes': self.state.strokes})
 
-            while self._running:
+            while True:
                 raw_line = file_obj.readline()
                 if not raw_line:
                     break
@@ -94,13 +94,12 @@ class EmbeddedWhiteboardServer:
             self._send(client_socket, payload)
 
 
-class WhiteboardApp:
+class WhiteboardClientApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title('Shared Whiteboard (Single-File App)')
+        self.root.title('Shared Whiteboard (Remote Client)')
         self.root.geometry('1200x760')
 
-        self.server = None
         self.socket = None
         self.reader = None
         self.connected = False
@@ -115,8 +114,8 @@ class WhiteboardApp:
         toolbar = tk.Frame(self.root, padx=8, pady=8)
         toolbar.pack(fill='x')
 
-        tk.Label(toolbar, text='Host:').pack(side='left')
-        self.host_entry = tk.Entry(toolbar, width=16)
+        tk.Label(toolbar, text='Server Host:').pack(side='left')
+        self.host_entry = tk.Entry(toolbar, width=18)
         self.host_entry.insert(0, DEFAULT_HOST)
         self.host_entry.pack(side='left', padx=(4, 8))
 
@@ -124,9 +123,6 @@ class WhiteboardApp:
         self.port_entry = tk.Entry(toolbar, width=8)
         self.port_entry.insert(0, str(DEFAULT_PORT))
         self.port_entry.pack(side='left', padx=(4, 8))
-
-        self.start_local_btn = tk.Button(toolbar, text='Start Local Session', command=self.start_local_session)
-        self.start_local_btn.pack(side='left', padx=(0, 8))
 
         self.connect_btn = tk.Button(toolbar, text='Connect', command=self.connect)
         self.connect_btn.pack(side='left', padx=(0, 8))
@@ -161,24 +157,6 @@ class WhiteboardApp:
         host = self.host_entry.get().strip() or DEFAULT_HOST
         port = int(self.port_entry.get().strip())
         return host, port
-
-    def start_local_session(self) -> None:
-        try:
-            host, port = self._get_host_port()
-        except ValueError:
-            messagebox.showerror('Invalid Port', 'Port must be a number.')
-            return
-
-        if not self.server:
-            self.server = EmbeddedWhiteboardServer(host, port)
-            try:
-                self.server.start()
-            except OSError as error:
-                self.server = None
-                messagebox.showerror('Server Error', str(error))
-                return
-
-        self.connect()
 
     def connect(self) -> None:
         if self.connected:
@@ -254,6 +232,7 @@ class WhiteboardApp:
     def send(self, payload: dict) -> None:
         if not self.connected or not self.socket:
             return
+
         try:
             self.socket.sendall((json.dumps(payload) + '\n').encode('utf-8'))
         except OSError:
@@ -296,7 +275,29 @@ class WhiteboardApp:
         self.current_points = []
 
 
-if __name__ == '__main__':
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Shared Whiteboard one-file app')
+    parser.add_argument('--server', action='store_true', help='Run in dedicated server mode (non-GUI)')
+    parser.add_argument('--host', default=DEFAULT_HOST, help='Host/IP to bind server mode or default connect host')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help='TCP port for server/client')
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.server:
+        WhiteboardServer(args.host, args.port).start()
+        return
+
+    global DEFAULT_HOST, DEFAULT_PORT
+    DEFAULT_HOST = args.host
+    DEFAULT_PORT = args.port
+
     root = tk.Tk()
-    WhiteboardApp(root)
+    WhiteboardClientApp(root)
     root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

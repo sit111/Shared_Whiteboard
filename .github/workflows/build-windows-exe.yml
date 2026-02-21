@@ -22,7 +22,7 @@ jobs:
         run: python -m pip install --upgrade pip pyinstaller
 
       - name: Build one-file EXE
-        run: pyinstaller --clean --noconfirm --onefile --windowed --name SharedWhiteboard whiteboard_app.py
+        run: pyinstaller --clean --noconfirm --onefile --name SharedWhiteboard whiteboard_app.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
