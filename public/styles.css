@@ -1,0 +1,5 @@
+body { margin: 0; font-family: Arial, sans-serif; }
+header { background: #222; color: #fff; padding: 8px 12px; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+canvas { display: block; width: 100vw; height: calc(100vh - 64px); background: #fff; cursor: crosshair; }
+button { padding: 6px 10px; }

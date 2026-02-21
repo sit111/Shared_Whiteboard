@@ -1,35 +1,20 @@
 @echo off
 setlocal
 
-where py >nul 2>nul
+where g++ >nul 2>nul
 if %errorlevel% neq 0 (
-  echo [ERROR] Python launcher (py) not found. Install Python for Windows first.
+  echo [ERROR] g++ not found. Install MinGW-w64 and add g++ to PATH.
   exit /b 1
 )
 
-echo [1/3] Ensuring pip is available...
-py -m ensurepip --upgrade >nul 2>nul
-
-echo [2/3] Installing/upgrading build dependency: pyinstaller...
-py -m pip install --upgrade pip pyinstaller
-if %errorlevel% neq 0 (
-  echo [ERROR] Failed to install pyinstaller.
-  exit /b 1
-)
-
-echo [3/3] Building one-file Windows executable...
-py -m PyInstaller --clean --noconfirm --onefile --name SharedWhiteboard whiteboard_app.py
+echo Building SharedWhiteboard.exe from C++ source...
+g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -o SharedWhiteboard.exe
 if %errorlevel% neq 0 (
   echo [ERROR] Build failed.
   exit /b 1
 )
 
 echo.
-echo Build complete.
-echo EXE path: dist\SharedWhiteboard.exe
-echo.
-echo Run server on remote machine:
-echo   SharedWhiteboard.exe --server --host 0.0.0.0 --port 5050
-echo Run client on user machine:
-echo   SharedWhiteboard.exe --host SERVER_PUBLIC_IP --port 5050
+echo Build complete: SharedWhiteboard.exe
+echo Run: SharedWhiteboard.exe 8080
 endlocal
