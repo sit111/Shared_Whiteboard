@@ -1,24 +1,30 @@
-# Shared Whiteboard (ONE-FILE EXE, NON-LOCAL READY)
+# Shared Whiteboard (One-File EXE + Rooms)
 
-Source code is one file:
+Single source file:
 - `whiteboard_app.py`
 
-Output is one executable file:
+Single output executable:
 - `SharedWhiteboard.exe`
 
-## Non-local usage (remote server)
+## What is improved
 
-Run one machine as the server (VPS/cloud/remote PC):
+- Room-based collaboration (each room has isolated board state)
+- Remote server mode for hosting on any PC/VPS
+- GUI client mode for users joining a server + room
+
+## Run server on host PC
 
 ```bash
 SharedWhiteboard.exe --server --host 0.0.0.0 --port 5050
 ```
 
-Then clients connect from other machines:
+## Run client on user PC
 
 ```bash
-SharedWhiteboard.exe --host <SERVER_PUBLIC_IP> --port 5050
+SharedWhiteboard.exe --host <SERVER_PUBLIC_IP> --port 5050 --room team-a
 ```
+
+Or set room from the GUI room field and click **Join Room**.
 
 ## Build `.exe` on Windows
 
@@ -29,16 +35,16 @@ build_exe.bat
 Build output:
 - `dist\SharedWhiteboard.exe`
 
-## Build `.exe` on GitHub (not local)
+## Build `.exe` on GitHub Actions
 
-Workflow:
+Workflow file:
 - `.github/workflows/build-windows-exe.yml`
 
 Steps:
-1. Push this repo to GitHub.
+1. Push to GitHub.
 2. Open **Actions** → **Build Windows EXE**.
-3. Run workflow.
-4. Download `SharedWhiteboard-exe` artifact.
+3. Run the workflow.
+4. Download artifact `SharedWhiteboard-exe`.
 
 ## Run from source (optional)
 
@@ -49,5 +55,5 @@ python3 whiteboard_app.py --server --host 0.0.0.0 --port 5050
 
 Client mode:
 ```bash
-python3 whiteboard_app.py --host <SERVER_IP> --port 5050
+python3 whiteboard_app.py --host <SERVER_IP> --port 5050 --room team-a
 ```

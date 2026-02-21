@@ -5,56 +5,50 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import colorchooser, messagebox
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 5050
+DEFAULT_ROOM = 'main'
 
 
 @dataclass
-class WhiteboardState:
+class RoomState:
     strokes: List[dict] = field(default_factory=list)
+
+
+@dataclass
+class ClientInfo:
+    address: Tuple[str, int]
+    room: Optional[str] = None
 
 
 class WhiteboardServer:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.state = WhiteboardState()
-        self.clients: Dict[socket.socket, Tuple[str, int]] = {}
+        self.rooms: Dict[str, RoomState] = {}
+        self.clients: Dict[socket.socket, ClientInfo] = {}
         self.lock = threading.Lock()
-        self._server_socket = None
-        self._running = False
 
     def start(self) -> None:
-        if self._running:
-            return
-
-        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind((self.host, self.port))
-        self._server_socket.listen()
-        self._running = True
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen()
 
         print(f"Whiteboard server listening on {self.host}:{self.port}")
 
-        while self._running:
-            try:
-                client_socket, address = self._server_socket.accept()
-            except OSError:
-                break
-
+        while True:
+            client_socket, address = server_socket.accept()
             with self.lock:
-                self.clients[client_socket] = address
-
+                self.clients[client_socket] = ClientInfo(address=address)
             threading.Thread(target=self._handle_client, args=(client_socket,), daemon=True).start()
 
     def _handle_client(self, client_socket: socket.socket) -> None:
         file_obj = client_socket.makefile('rwb')
 
         try:
-            self._send(client_socket, {'type': 'sync', 'strokes': self.state.strokes})
-
             while True:
                 raw_line = file_obj.readline()
                 if not raw_line:
@@ -66,19 +60,67 @@ class WhiteboardServer:
                     continue
 
                 message_type = message.get('type')
-                if message_type == 'draw' and isinstance(message.get('stroke', {}).get('points'), list):
-                    with self.lock:
-                        self.state.strokes.append(message['stroke'])
-                    self._broadcast({'type': 'draw', 'stroke': message['stroke']})
+                if message_type == 'join':
+                    self._handle_join(client_socket, message)
+                elif message_type == 'draw':
+                    self._handle_draw(client_socket, message)
                 elif message_type == 'clear':
-                    with self.lock:
-                        self.state.strokes.clear()
-                    self._broadcast({'type': 'clear'})
+                    self._handle_clear(client_socket)
         finally:
             with self.lock:
                 self.clients.pop(client_socket, None)
             file_obj.close()
             client_socket.close()
+
+    def _normalize_room(self, raw_room: object) -> str:
+        if isinstance(raw_room, str) and raw_room.strip():
+            return raw_room.strip()[:64]
+        return DEFAULT_ROOM
+
+    def _handle_join(self, client_socket: socket.socket, message: dict) -> None:
+        room = self._normalize_room(message.get('room'))
+
+        with self.lock:
+            client_info = self.clients.get(client_socket)
+            if not client_info:
+                return
+            client_info.room = room
+
+            if room not in self.rooms:
+                self.rooms[room] = RoomState()
+            strokes = list(self.rooms[room].strokes)
+
+        self._send(client_socket, {'type': 'sync', 'room': room, 'strokes': strokes})
+
+    def _handle_draw(self, client_socket: socket.socket, message: dict) -> None:
+        stroke = message.get('stroke', {})
+        if not isinstance(stroke.get('points'), list):
+            return
+
+        with self.lock:
+            client_info = self.clients.get(client_socket)
+            if not client_info or not client_info.room:
+                return
+
+            room = client_info.room
+            if room not in self.rooms:
+                self.rooms[room] = RoomState()
+            self.rooms[room].strokes.append(stroke)
+
+        self._broadcast_room(room, {'type': 'draw', 'room': room, 'stroke': stroke})
+
+    def _handle_clear(self, client_socket: socket.socket) -> None:
+        with self.lock:
+            client_info = self.clients.get(client_socket)
+            if not client_info or not client_info.room:
+                return
+
+            room = client_info.room
+            if room not in self.rooms:
+                self.rooms[room] = RoomState()
+            self.rooms[room].strokes.clear()
+
+        self._broadcast_room(room, {'type': 'clear', 'room': room})
 
     def _send(self, client_socket: socket.socket, payload: dict) -> None:
         try:
@@ -86,23 +128,28 @@ class WhiteboardServer:
         except OSError:
             pass
 
-    def _broadcast(self, payload: dict) -> None:
+    def _broadcast_room(self, room: str, payload: dict) -> None:
         with self.lock:
-            sockets = list(self.clients.keys())
+            room_clients = [
+                sock
+                for sock, info in self.clients.items()
+                if info.room == room
+            ]
 
-        for client_socket in sockets:
+        for client_socket in room_clients:
             self._send(client_socket, payload)
 
 
 class WhiteboardClientApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title('Shared Whiteboard (Remote Client)')
+        self.root.title('Shared Whiteboard (Rooms)')
         self.root.geometry('1200x760')
 
         self.socket = None
         self.reader = None
         self.connected = False
+        self.active_room = DEFAULT_ROOM
 
         self.current_color = '#111111'
         self.current_size = 3
@@ -115,17 +162,25 @@ class WhiteboardClientApp:
         toolbar.pack(fill='x')
 
         tk.Label(toolbar, text='Server Host:').pack(side='left')
-        self.host_entry = tk.Entry(toolbar, width=18)
+        self.host_entry = tk.Entry(toolbar, width=14)
         self.host_entry.insert(0, DEFAULT_HOST)
         self.host_entry.pack(side='left', padx=(4, 8))
 
         tk.Label(toolbar, text='Port:').pack(side='left')
-        self.port_entry = tk.Entry(toolbar, width=8)
+        self.port_entry = tk.Entry(toolbar, width=7)
         self.port_entry.insert(0, str(DEFAULT_PORT))
         self.port_entry.pack(side='left', padx=(4, 8))
 
+        tk.Label(toolbar, text='Room:').pack(side='left')
+        self.room_entry = tk.Entry(toolbar, width=12)
+        self.room_entry.insert(0, DEFAULT_ROOM)
+        self.room_entry.pack(side='left', padx=(4, 8))
+
         self.connect_btn = tk.Button(toolbar, text='Connect', command=self.connect)
         self.connect_btn.pack(side='left', padx=(0, 8))
+
+        self.join_btn = tk.Button(toolbar, text='Join Room', command=self.join_room, state='disabled')
+        self.join_btn.pack(side='left', padx=(0, 8))
 
         tk.Button(toolbar, text='Pick Color', command=self.pick_color).pack(side='left', padx=(0, 8))
 
@@ -133,7 +188,7 @@ class WhiteboardClientApp:
         self.size_scale.set(self.current_size)
         self.size_scale.pack(side='left', padx=(0, 8))
 
-        tk.Button(toolbar, text='Clear Board', command=self.clear_board).pack(side='left', padx=(0, 8))
+        tk.Button(toolbar, text='Clear Room', command=self.clear_board).pack(side='left', padx=(0, 8))
 
         self.status_label = tk.Label(toolbar, text='Disconnected', fg='#aa3333')
         self.status_label.pack(side='right')
@@ -158,6 +213,10 @@ class WhiteboardClientApp:
         port = int(self.port_entry.get().strip())
         return host, port
 
+    def _get_room(self) -> str:
+        room = self.room_entry.get().strip()
+        return room[:64] if room else DEFAULT_ROOM
+
     def connect(self) -> None:
         if self.connected:
             return
@@ -173,11 +232,22 @@ class WhiteboardClientApp:
             self.socket.settimeout(None)
             self.reader = self.socket.makefile('rb')
             self.connected = True
-            self.status_label.config(text=f'Connected to {host}:{port}', fg='#227722')
             self.connect_btn.config(state='disabled')
+            self.join_btn.config(state='normal')
+            self.status_label.config(text=f'Connected to {host}:{port}', fg='#227722')
             threading.Thread(target=self.listen_loop, daemon=True).start()
+            self.join_room()
         except OSError as error:
             messagebox.showerror('Connection Error', str(error))
+
+    def join_room(self) -> None:
+        if not self.connected:
+            return
+
+        room = self._get_room()
+        self.active_room = room
+        self.send({'type': 'join', 'room': room})
+        self.status_label.config(text=f'Connected | room: {room}', fg='#227722')
 
     def listen_loop(self) -> None:
         try:
@@ -197,15 +267,25 @@ class WhiteboardClientApp:
 
     def disconnect_ui(self) -> None:
         self.connected = False
+        self.active_room = DEFAULT_ROOM
         self.status_label.config(text='Disconnected', fg='#aa3333')
         self.connect_btn.config(state='normal')
+        self.join_btn.config(state='disabled')
 
     def handle_message(self, message: dict) -> None:
         message_type = message.get('type')
+        room = message.get('room')
+
+        if room and room != self.active_room and message_type != 'sync':
+            return
+
         if message_type == 'sync':
+            synced_room = message.get('room', self.active_room)
+            self.active_room = synced_room
             self.canvas.delete('all')
             for stroke in message.get('strokes', []):
                 self.draw_stroke(stroke)
+            self.status_label.config(text=f'Connected | room: {synced_room}', fg='#227722')
         elif message_type == 'draw':
             self.draw_stroke(message.get('stroke', {}))
         elif message_type == 'clear':
@@ -276,10 +356,11 @@ class WhiteboardClientApp:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Shared Whiteboard one-file app')
+    parser = argparse.ArgumentParser(description='Shared Whiteboard one-file app with rooms')
     parser.add_argument('--server', action='store_true', help='Run in dedicated server mode (non-GUI)')
-    parser.add_argument('--host', default=DEFAULT_HOST, help='Host/IP to bind server mode or default connect host')
+    parser.add_argument('--host', default=DEFAULT_HOST, help='Host/IP for server bind or default client connect')
     parser.add_argument('--port', type=int, default=DEFAULT_PORT, help='TCP port for server/client')
+    parser.add_argument('--room', default=DEFAULT_ROOM, help='Default room for GUI client')
     return parser.parse_args()
 
 
@@ -290,9 +371,10 @@ def main() -> None:
         WhiteboardServer(args.host, args.port).start()
         return
 
-    global DEFAULT_HOST, DEFAULT_PORT
+    global DEFAULT_HOST, DEFAULT_PORT, DEFAULT_ROOM
     DEFAULT_HOST = args.host
     DEFAULT_PORT = args.port
+    DEFAULT_ROOM = args.room if args.room.strip() else DEFAULT_ROOM
 
     root = tk.Tk()
     WhiteboardClientApp(root)
