@@ -1,42 +1,36 @@
-# Shared Whiteboard (Desktop Source Code)
+# Shared Whiteboard (Single-File Desktop Source)
 
-This repository now provides a **desktop shared whiteboard program** (not a web app).
+This project is now a **single Python source file** desktop app:
 
-It contains:
-- `whiteboard_server.py` - TCP server that keeps board state and broadcasts updates
-- `whiteboard_client.py` - Tkinter desktop whiteboard client GUI
+- `whiteboard_app.py`
 
-## Features
+It includes both:
+- embedded whiteboard server logic
+- desktop GUI whiteboard client logic
 
-- Real-time shared drawing across multiple desktop clients
-- Brush color picker and brush size slider
-- Clear board synchronization for all connected users
-- Uses only Python standard library (no third-party runtime dependencies)
+So you can package it into **one `.exe` file**.
 
-## Run
-
-### 1) Start the server
+## Run from source
 
 ```bash
-python3 whiteboard_server.py
+python3 whiteboard_app.py
 ```
 
-### 2) Start one or more clients
+In the app:
+1. Choose host/port.
+2. Click **Start Local Session** to host + auto-connect on the same machine.
+3. Or click **Connect** to join an existing host.
 
-```bash
-python3 whiteboard_client.py
-```
+## Build one-file `.exe` (includes runtime/dependencies)
 
-In each client, enter server host/port and click **Connect**.
-
-## Build as `.exe` (Windows)
-
-On Windows (with Python installed), you can package the client/server into executables:
+On Windows:
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed whiteboard_client.py
-pyinstaller --onefile whiteboard_server.py
+pyinstaller --onefile --windowed --name SharedWhiteboard whiteboard_app.py
 ```
 
-Generated executables will be under `dist/`.
+Output:
+- `dist/SharedWhiteboard.exe`
+
+That `.exe` is a single file and carries the Python runtime and required modules from this app.

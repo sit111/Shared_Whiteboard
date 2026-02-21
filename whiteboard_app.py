@@ -2,19 +2,105 @@ import json
 import socket
 import threading
 import tkinter as tk
+from dataclasses import dataclass, field
 from tkinter import colorchooser, messagebox
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 5050
 
 
-class WhiteboardClient:
+@dataclass
+class WhiteboardState:
+    strokes: List[dict] = field(default_factory=list)
+
+
+class EmbeddedWhiteboardServer:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.state = WhiteboardState()
+        self.clients: Dict[socket.socket, Tuple[str, int]] = {}
+        self.lock = threading.Lock()
+        self._server_socket = None
+        self._running = False
+
+    def start(self) -> None:
+        if self._running:
+            return
+
+        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_socket.bind((self.host, self.port))
+        self._server_socket.listen()
+        self._running = True
+
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self) -> None:
+        while self._running and self._server_socket:
+            try:
+                client_socket, address = self._server_socket.accept()
+            except OSError:
+                break
+
+            with self.lock:
+                self.clients[client_socket] = address
+
+            threading.Thread(target=self._handle_client, args=(client_socket,), daemon=True).start()
+
+    def _handle_client(self, client_socket: socket.socket) -> None:
+        file_obj = client_socket.makefile('rwb')
+
+        try:
+            self._send(client_socket, {'type': 'sync', 'strokes': self.state.strokes})
+
+            while self._running:
+                raw_line = file_obj.readline()
+                if not raw_line:
+                    break
+
+                try:
+                    message = json.loads(raw_line.decode('utf-8'))
+                except json.JSONDecodeError:
+                    continue
+
+                message_type = message.get('type')
+                if message_type == 'draw' and isinstance(message.get('stroke', {}).get('points'), list):
+                    with self.lock:
+                        self.state.strokes.append(message['stroke'])
+                    self._broadcast({'type': 'draw', 'stroke': message['stroke']})
+                elif message_type == 'clear':
+                    with self.lock:
+                        self.state.strokes.clear()
+                    self._broadcast({'type': 'clear'})
+        finally:
+            with self.lock:
+                self.clients.pop(client_socket, None)
+            file_obj.close()
+            client_socket.close()
+
+    def _send(self, client_socket: socket.socket, payload: dict) -> None:
+        try:
+            client_socket.sendall((json.dumps(payload) + '\n').encode('utf-8'))
+        except OSError:
+            pass
+
+    def _broadcast(self, payload: dict) -> None:
+        with self.lock:
+            sockets = list(self.clients.keys())
+
+        for client_socket in sockets:
+            self._send(client_socket, payload)
+
+
+class WhiteboardApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title('Shared Whiteboard Desktop')
+        self.root.title('Shared Whiteboard (Single-File App)')
         self.root.geometry('1200x760')
 
+        self.server = None
         self.socket = None
         self.reader = None
         self.connected = False
@@ -29,18 +115,21 @@ class WhiteboardClient:
         toolbar = tk.Frame(self.root, padx=8, pady=8)
         toolbar.pack(fill='x')
 
-        tk.Label(toolbar, text='Server:').pack(side='left')
-        self.host_entry = tk.Entry(toolbar, width=18)
+        tk.Label(toolbar, text='Host:').pack(side='left')
+        self.host_entry = tk.Entry(toolbar, width=16)
         self.host_entry.insert(0, DEFAULT_HOST)
         self.host_entry.pack(side='left', padx=(4, 8))
 
         tk.Label(toolbar, text='Port:').pack(side='left')
-        self.port_entry = tk.Entry(toolbar, width=7)
+        self.port_entry = tk.Entry(toolbar, width=8)
         self.port_entry.insert(0, str(DEFAULT_PORT))
         self.port_entry.pack(side='left', padx=(4, 8))
 
-        self.connect_button = tk.Button(toolbar, text='Connect', command=self.connect)
-        self.connect_button.pack(side='left', padx=(0, 8))
+        self.start_local_btn = tk.Button(toolbar, text='Start Local Session', command=self.start_local_session)
+        self.start_local_btn.pack(side='left', padx=(0, 8))
+
+        self.connect_btn = tk.Button(toolbar, text='Connect', command=self.connect)
+        self.connect_btn.pack(side='left', padx=(0, 8))
 
         tk.Button(toolbar, text='Pick Color', command=self.pick_color).pack(side='left', padx=(0, 8))
 
@@ -68,13 +157,35 @@ class WhiteboardClient:
         if color:
             self.current_color = color
 
+    def _get_host_port(self) -> Tuple[str, int]:
+        host = self.host_entry.get().strip() or DEFAULT_HOST
+        port = int(self.port_entry.get().strip())
+        return host, port
+
+    def start_local_session(self) -> None:
+        try:
+            host, port = self._get_host_port()
+        except ValueError:
+            messagebox.showerror('Invalid Port', 'Port must be a number.')
+            return
+
+        if not self.server:
+            self.server = EmbeddedWhiteboardServer(host, port)
+            try:
+                self.server.start()
+            except OSError as error:
+                self.server = None
+                messagebox.showerror('Server Error', str(error))
+                return
+
+        self.connect()
+
     def connect(self) -> None:
         if self.connected:
             return
 
-        host = self.host_entry.get().strip() or DEFAULT_HOST
         try:
-            port = int(self.port_entry.get().strip())
+            host, port = self._get_host_port()
         except ValueError:
             messagebox.showerror('Invalid Port', 'Port must be a number.')
             return
@@ -84,8 +195,8 @@ class WhiteboardClient:
             self.socket.settimeout(None)
             self.reader = self.socket.makefile('rb')
             self.connected = True
-            self.status_label.config(text='Connected', fg='#227722')
-            self.connect_button.config(state='disabled')
+            self.status_label.config(text=f'Connected to {host}:{port}', fg='#227722')
+            self.connect_btn.config(state='disabled')
             threading.Thread(target=self.listen_loop, daemon=True).start()
         except OSError as error:
             messagebox.showerror('Connection Error', str(error))
@@ -109,11 +220,10 @@ class WhiteboardClient:
     def disconnect_ui(self) -> None:
         self.connected = False
         self.status_label.config(text='Disconnected', fg='#aa3333')
-        self.connect_button.config(state='normal')
+        self.connect_btn.config(state='normal')
 
     def handle_message(self, message: dict) -> None:
         message_type = message.get('type')
-
         if message_type == 'sync':
             self.canvas.delete('all')
             for stroke in message.get('strokes', []):
@@ -144,7 +254,6 @@ class WhiteboardClient:
     def send(self, payload: dict) -> None:
         if not self.connected or not self.socket:
             return
-
         try:
             self.socket.sendall((json.dumps(payload) + '\n').encode('utf-8'))
         except OSError:
@@ -188,6 +297,6 @@ class WhiteboardClient:
 
 
 if __name__ == '__main__':
-    app_root = tk.Tk()
-    WhiteboardClient(app_root)
-    app_root.mainloop()
+    root = tk.Tk()
+    WhiteboardApp(root)
+    root.mainloop()
