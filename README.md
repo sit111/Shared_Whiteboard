@@ -1,24 +1,12 @@
-# Shared Whiteboard (C++)
+# Shared Whiteboard (Single Program `.exe`, C++)
 
-This version uses **C++ (no Python)** for the server and serves a browser whiteboard UI with room-based collaboration.
+You asked for **one program**. This version is exactly that:
+- One source file: `whiteboard_server.cpp`
+- One output program: `SharedWhiteboard.exe`
+- No external `public/` files needed at runtime (HTML/CSS/JS are embedded in the EXE)
 
-## Features
-- C++ server (`whiteboard_server.cpp`)
-- Room isolation (`?room=team-a` etc.)
-- Real-time updates via SSE (`draw`, `clear`, `sync`)
-- Works across PCs: host once, others open browser to host IP
-
-## Run on Linux/macOS (g++)
-```bash
-g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -o shared_whiteboard
-./shared_whiteboard 8080
-```
-
-Then open:
-- `http://<SERVER_IP>:8080`
-
-## Build `.exe` on Windows (MinGW g++)
-Use:
+## Build on Windows
+Run:
 ```bat
 build_exe.bat
 ```
@@ -26,14 +14,21 @@ build_exe.bat
 Output:
 - `SharedWhiteboard.exe`
 
-Run:
+## Run
 ```bat
 SharedWhiteboard.exe 8080
 ```
-Then share `http://<HOST_PC_IP>:8080` with other users.
 
-## Project Files
-- `whiteboard_server.cpp` - C++ HTTP/SSE room server
-- `public/index.html` - whiteboard page
-- `public/app.js` - drawing + sync client
-- `public/styles.css` - UI styles
+Then people connect from their PCs in a browser:
+- `http://<HOST_PC_IP>:8080`
+
+## Rooms
+- Type a room name and click **Join**.
+- Each room has isolated board state.
+- `Clear Room` only clears the active room.
+
+## Build on Linux/macOS (for testing)
+```bash
+g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -o shared_whiteboard
+./shared_whiteboard 8080
+```
