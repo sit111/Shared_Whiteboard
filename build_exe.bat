@@ -16,5 +16,6 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Build complete: SharedWhiteboard.exe
-echo Run: SharedWhiteboard.exe 8080
+echo Run server: SharedWhiteboard.exe --server --port 5050
+echo Run client: SharedWhiteboard.exe --host 127.0.0.1 --port 5050 --room main
 endlocal

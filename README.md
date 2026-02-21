@@ -1,9 +1,12 @@
-# Shared Whiteboard (Single Program `.exe`, C++)
+# Shared Whiteboard (Single `.exe` Program, C++)
 
-You asked for **one program**. This version is exactly that:
+This is now a **program-only** implementation (no website UI).
+
+## What you get
 - One source file: `whiteboard_server.cpp`
-- One output program: `SharedWhiteboard.exe`
-- No external `public/` files needed at runtime (HTML/CSS/JS are embedded in the EXE)
+- One executable: `SharedWhiteboard.exe`
+- Same EXE can run as server or client
+- Room support (`--room`) so groups are separated
 
 ## Build on Windows
 Run:
@@ -14,21 +17,28 @@ build_exe.bat
 Output:
 - `SharedWhiteboard.exe`
 
-## Run
+## Run as server (host PC)
 ```bat
-SharedWhiteboard.exe 8080
+SharedWhiteboard.exe --server --port 5050
 ```
 
-Then people connect from their PCs in a browser:
-- `http://<HOST_PC_IP>:8080`
+## Run as client (other PC)
+```bat
+SharedWhiteboard.exe --host <HOST_PC_IP> --port 5050 --room team1
+```
 
-## Rooms
-- Type a room name and click **Join**.
-- Each room has isolated board state.
-- `Clear Room` only clears the active room.
+Client commands:
+- `draw x y [char]`
+- `clear`
+- `show`
+- `room <name>`
+- `state`
+- `quit`
 
-## Build on Linux/macOS (for testing)
+Board size is `60x20`.
+
+## Linux/macOS quick test
 ```bash
 g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -o shared_whiteboard
-./shared_whiteboard 8080
+./shared_whiteboard --server --port 5050
 ```

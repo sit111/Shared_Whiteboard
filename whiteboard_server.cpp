@@ -3,12 +3,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <csignal>
-#include <cstdlib>
 #include <cctype>
+#include <chrono>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -19,133 +17,19 @@
 
 namespace {
 
-const char* kHtml = R"HTML(<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Shared Whiteboard</title>
-  <style>
-    body { margin: 0; font-family: Arial, sans-serif; }
-    header { background: #222; color: #fff; padding: 8px 12px; }
-    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    canvas { display: block; width: 100vw; height: calc(100vh - 64px); background: #fff; cursor: crosshair; }
-    button { padding: 6px 10px; }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Shared Whiteboard (Single EXE)</h1>
-    <div class="controls">
-      <label>Room <input id="room" value="main" /></label>
-      <button id="join">Join</button>
-      <label>Color <input id="color" type="color" value="#111111" /></label>
-      <label>Size <input id="size" type="range" min="1" max="20" value="3" /></label>
-      <button id="clear">Clear Room</button>
-      <span id="status">disconnected</span>
-    </div>
-  </header>
-  <canvas id="board"></canvas>
-  <script>
-    const board = document.getElementById('board');
-    const ctx = board.getContext('2d');
-    const statusEl = document.getElementById('status');
-    const roomInput = document.getElementById('room');
-    const joinBtn = document.getElementById('join');
-    const colorInput = document.getElementById('color');
-    const sizeInput = document.getElementById('size');
-    const clearBtn = document.getElementById('clear');
-
-    let room = roomInput.value.trim() || 'main';
-    let eventSource;
-    let drawing = false;
-    let points = [];
-
-    function resize() {
-      board.width = window.innerWidth;
-      board.height = window.innerHeight - document.querySelector('header').offsetHeight;
-    }
-
-    function drawStroke(stroke) {
-      if (!stroke?.points?.length) return;
-      ctx.strokeStyle = stroke.color || '#111';
-      ctx.lineWidth = stroke.size || 3;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-      for (let i = 1; i < stroke.points.length; i++) {
-        ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
-      }
-      ctx.stroke();
-    }
-
-    function connect() {
-      if (eventSource) eventSource.close();
-      room = roomInput.value.trim() || 'main';
-      eventSource = new EventSource(`/events?room=${encodeURIComponent(room)}`);
-      eventSource.addEventListener('open', () => { statusEl.textContent = `connected:${room}`; });
-      eventSource.addEventListener('error', () => { statusEl.textContent = 'reconnecting...'; });
-      eventSource.addEventListener('sync', (event) => {
-        const payload = JSON.parse(event.data);
-        ctx.clearRect(0, 0, board.width, board.height);
-        (payload.strokes || []).forEach(drawStroke);
-      });
-      eventSource.addEventListener('draw', (event) => {
-        const payload = JSON.parse(event.data);
-        if (payload.room === room) drawStroke(payload.stroke);
-      });
-      eventSource.addEventListener('clear', (event) => {
-        const payload = JSON.parse(event.data);
-        if (payload.room === room) ctx.clearRect(0, 0, board.width, board.height);
-      });
-    }
-
-    function post(path, payload) {
-      return fetch(`${path}?room=${encodeURIComponent(room)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-    }
-
-    joinBtn.addEventListener('click', connect);
-    clearBtn.addEventListener('click', () => post('/clear', {}));
-
-    board.addEventListener('pointerdown', (e) => {
-      drawing = true;
-      points = [{ x: e.offsetX, y: e.offsetY }];
-    });
-
-    board.addEventListener('pointermove', (e) => {
-      if (!drawing) return;
-      points.push({ x: e.offsetX, y: e.offsetY });
-      drawStroke({ color: colorInput.value, size: Number(sizeInput.value), points: points.slice(-2) });
-    });
-
-    board.addEventListener('pointerup', async () => {
-      if (!drawing) return;
-      drawing = false;
-      await post('/draw', { color: colorInput.value, size: Number(sizeInput.value), points });
-      points = [];
-    });
-
-    window.addEventListener('resize', resize);
-    resize();
-    connect();
-  </script>
-</body>
-</html>)HTML";
-
-std::atomic<bool> running(true);
+constexpr int kBoardWidth = 60;
+constexpr int kBoardHeight = 20;
 
 struct RoomState {
-    std::vector<std::string> strokes;
-    std::vector<int> sseClients;
+    std::vector<std::string> board;
+    std::vector<int> clients;
+
+    RoomState() : board(kBoardHeight, std::string(kBoardWidth, '.')) {}
 };
 
-std::mutex roomsMutex;
-std::map<std::string, RoomState> rooms;
+std::mutex gRoomsMutex;
+std::map<std::string, RoomState> gRooms;
+std::atomic<bool> gRunning(true);
 
 std::string trim(const std::string& s) {
     size_t start = 0;
@@ -153,57 +37,6 @@ std::string trim(const std::string& s) {
     size_t end = s.size();
     while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
     return s.substr(start, end - start);
-}
-
-std::string normalizeRoom(const std::string& room) {
-    std::string normalized = trim(room);
-    if (normalized.empty()) return "main";
-    if (normalized.size() > 64) normalized.resize(64);
-    return normalized;
-}
-
-std::string urlDecode(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == '%' && i + 2 < text.size()) {
-            const std::string hex = text.substr(i + 1, 2);
-            out.push_back(static_cast<char>(std::strtol(hex.c_str(), nullptr, 16)));
-            i += 2;
-        } else if (text[i] == '+') {
-            out.push_back(' ');
-        } else {
-            out.push_back(text[i]);
-        }
-    }
-    return out;
-}
-
-std::map<std::string, std::string> parseQuery(const std::string& query) {
-    std::map<std::string, std::string> params;
-    std::stringstream ss(query);
-    std::string item;
-    while (std::getline(ss, item, '&')) {
-        const size_t eq = item.find('=');
-        if (eq == std::string::npos) continue;
-        params[urlDecode(item.substr(0, eq))] = urlDecode(item.substr(eq + 1));
-    }
-    return params;
-}
-
-std::string jsonEscape(const std::string& value) {
-    std::string out;
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default: out += ch; break;
-        }
-    }
-    return out;
 }
 
 bool sendAll(int sock, const std::string& data) {
@@ -216,183 +49,159 @@ bool sendAll(int sock, const std::string& data) {
     return true;
 }
 
-std::string httpResponse(const std::string& status, const std::string& contentType, const std::string& body,
-                         const std::string& extraHeaders = "") {
+bool sendLine(int sock, const std::string& line) {
+    return sendAll(sock, line + "\n");
+}
+
+bool readLine(int sock, std::string& lineOut) {
+    lineOut.clear();
+    char ch;
+    while (true) {
+        const ssize_t n = recv(sock, &ch, 1, 0);
+        if (n <= 0) return false;
+        if (ch == '\n') return true;
+        if (ch != '\r') lineOut.push_back(ch);
+        if (lineOut.size() > 8192) return false;
+    }
+}
+
+std::string normalizeRoom(const std::string& room) {
+    std::string out = trim(room);
+    if (out.empty()) out = "main";
+    if (out.size() > 64) out.resize(64);
+    return out;
+}
+
+std::string boardToWire(const std::vector<std::string>& board) {
     std::ostringstream out;
-    out << "HTTP/1.1 " << status << "\r\n"
-        << "Content-Type: " << contentType << "\r\n"
-        << "Content-Length: " << body.size() << "\r\n"
-        << extraHeaders
-        << "Connection: close\r\n\r\n"
-        << body;
+    for (size_t i = 0; i < board.size(); ++i) {
+        if (i) out << '|';
+        out << board[i];
+    }
     return out.str();
 }
 
-void broadcastSseLocked(const std::string& room, const std::string& event, const std::string& dataJson) {
-    const std::string payload = "event: " + event + "\n" + "data: " + dataJson + "\n\n";
-    auto& clients = rooms[room].sseClients;
+std::vector<std::string> boardFromWire(const std::string& payload) {
+    std::vector<std::string> board;
+    std::stringstream ss(payload);
+    std::string row;
+    while (std::getline(ss, row, '|')) {
+        if (row.size() < static_cast<size_t>(kBoardWidth)) row += std::string(kBoardWidth - row.size(), '.');
+        if (row.size() > static_cast<size_t>(kBoardWidth)) row.resize(kBoardWidth);
+        board.push_back(row);
+    }
+    while (board.size() < static_cast<size_t>(kBoardHeight)) board.push_back(std::string(kBoardWidth, '.'));
+    if (board.size() > static_cast<size_t>(kBoardHeight)) board.resize(kBoardHeight);
+    return board;
+}
+
+void cleanupClientFromRooms(int clientSock) {
+    std::lock_guard<std::mutex> lock(gRoomsMutex);
+    for (auto& [_, room] : gRooms) {
+        std::vector<int> keep;
+        for (int c : room.clients) {
+            if (c != clientSock) keep.push_back(c);
+        }
+        room.clients.swap(keep);
+    }
+}
+
+void broadcastToRoomLocked(const std::string& roomName, const std::string& line) {
+    auto& room = gRooms[roomName];
     std::vector<int> alive;
-    alive.reserve(clients.size());
-    for (const int client : clients) {
-        if (sendAll(client, payload)) {
-            alive.push_back(client);
+    alive.reserve(room.clients.size());
+    for (int c : room.clients) {
+        if (sendLine(c, line)) {
+            alive.push_back(c);
         } else {
-            close(client);
+            close(c);
         }
     }
-    clients.swap(alive);
+    room.clients.swap(alive);
 }
 
-void handleSse(int clientSock, const std::string& room) {
-    const std::string header =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: keep-alive\r\n\r\n";
-    if (!sendAll(clientSock, header)) {
+void handleServerClient(int clientSock) {
+    std::string roomName = "main";
+
+    if (!sendLine(clientSock, "HELLO " + std::to_string(kBoardWidth) + " " + std::to_string(kBoardHeight))) {
         close(clientSock);
         return;
     }
 
-    std::lock_guard<std::mutex> lock(roomsMutex);
-    rooms[room].sseClients.push_back(clientSock);
-
-    std::ostringstream sync;
-    sync << "{\"room\":\"" << jsonEscape(room) << "\",\"strokes\":[";
-    const auto& strokes = rooms[room].strokes;
-    for (size_t i = 0; i < strokes.size(); ++i) {
-        if (i) sync << ',';
-        sync << strokes[i];
-    }
-    sync << "]}";
-    broadcastSseLocked(room, "sync", sync.str());
-}
-
-void handleClient(int clientSock) {
-    std::string request;
-    char buffer[8192];
-    while (request.find("\r\n\r\n") == std::string::npos) {
-        const ssize_t n = recv(clientSock, buffer, sizeof(buffer), 0);
-        if (n <= 0) {
-            close(clientSock);
-            return;
-        }
-        request.append(buffer, static_cast<size_t>(n));
-        if (request.size() > 1024 * 1024) {
-            close(clientSock);
-            return;
-        }
+    {
+        std::lock_guard<std::mutex> lock(gRoomsMutex);
+        roomName = "main";
+        gRooms[roomName].clients.push_back(clientSock);
+        sendLine(clientSock, "STATE " + boardToWire(gRooms[roomName].board));
     }
 
-    const size_t headerEnd = request.find("\r\n\r\n");
-    const std::string headerText = request.substr(0, headerEnd);
-    std::string body = request.substr(headerEnd + 4);
-
-    std::stringstream headers(headerText);
-    std::string requestLine;
-    std::getline(headers, requestLine);
-    if (!requestLine.empty() && requestLine.back() == '\r') requestLine.pop_back();
-
-    std::string method, path, version;
-    std::stringstream rl(requestLine);
-    rl >> method >> path >> version;
-
-    std::map<std::string, std::string> headerMap;
-    size_t contentLength = 0;
     std::string line;
-    while (std::getline(headers, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::string key = trim(line.substr(0, colon));
-        std::string value = trim(line.substr(colon + 1));
-        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        headerMap[key] = value;
-    }
+    while (readLine(clientSock, line)) {
+        std::stringstream ss(line);
+        std::string cmd;
+        ss >> cmd;
 
-    if (headerMap.count("content-length")) {
-        contentLength = static_cast<size_t>(std::stoul(headerMap["content-length"]));
-    }
-    while (body.size() < contentLength) {
-        const ssize_t n = recv(clientSock, buffer, sizeof(buffer), 0);
-        if (n <= 0) break;
-        body.append(buffer, static_cast<size_t>(n));
-    }
+        if (cmd == "JOIN") {
+            std::string newRoom;
+            ss >> newRoom;
+            newRoom = normalizeRoom(newRoom);
 
-    std::string query;
-    const size_t qPos = path.find('?');
-    if (qPos != std::string::npos) {
-        query = path.substr(qPos + 1);
-        path = path.substr(0, qPos);
-    }
-    const auto params = parseQuery(query);
-    const std::string room = normalizeRoom(params.count("room") ? params.at("room") : "main");
+            std::lock_guard<std::mutex> lock(gRoomsMutex);
+            auto& oldClients = gRooms[roomName].clients;
+            std::vector<int> keep;
+            for (int c : oldClients) {
+                if (c != clientSock) keep.push_back(c);
+            }
+            oldClients.swap(keep);
 
-    if (method == "GET" && path == "/") {
-        sendAll(clientSock, httpResponse("200 OK", "text/html; charset=utf-8", kHtml));
-        close(clientSock);
-        return;
-    }
-
-    if (method == "GET" && path == "/state") {
-        std::ostringstream out;
-        std::lock_guard<std::mutex> lock(roomsMutex);
-        out << "{\"room\":\"" << jsonEscape(room) << "\",\"strokes\":[";
-        const auto& strokes = rooms[room].strokes;
-        for (size_t i = 0; i < strokes.size(); ++i) {
-            if (i) out << ',';
-            out << strokes[i];
+            roomName = newRoom;
+            gRooms[roomName].clients.push_back(clientSock);
+            sendLine(clientSock, "STATE " + boardToWire(gRooms[roomName].board));
+            continue;
         }
-        out << "]}";
-        sendAll(clientSock, httpResponse("200 OK", "application/json", out.str()));
-        close(clientSock);
-        return;
+
+        if (cmd == "DRAW") {
+            int x = -1;
+            int y = -1;
+            char mark = '#';
+            ss >> x >> y >> mark;
+            if (!ss || x < 0 || y < 0 || x >= kBoardWidth || y >= kBoardHeight) {
+                sendLine(clientSock, "ERROR invalid DRAW. usage: DRAW x y #");
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(gRoomsMutex);
+            gRooms[roomName].board[y][x] = mark;
+            broadcastToRoomLocked(roomName, "EVENT DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, mark));
+            continue;
+        }
+
+        if (cmd == "CLEAR") {
+            std::lock_guard<std::mutex> lock(gRoomsMutex);
+            gRooms[roomName].board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
+            broadcastToRoomLocked(roomName, "EVENT CLEAR");
+            continue;
+        }
+
+        if (cmd == "STATE") {
+            std::lock_guard<std::mutex> lock(gRoomsMutex);
+            sendLine(clientSock, "STATE " + boardToWire(gRooms[roomName].board));
+            continue;
+        }
+
+        if (cmd == "QUIT") {
+            break;
+        }
+
+        sendLine(clientSock, "ERROR unknown command");
     }
 
-    if (method == "GET" && path == "/events") {
-        handleSse(clientSock, room);
-        return;
-    }
-
-    if (method == "POST" && path == "/draw") {
-        std::lock_guard<std::mutex> lock(roomsMutex);
-        rooms[room].strokes.push_back(body);
-        std::ostringstream event;
-        event << "{\"room\":\"" << jsonEscape(room) << "\",\"stroke\":" << body << "}";
-        broadcastSseLocked(room, "draw", event.str());
-        sendAll(clientSock, httpResponse("200 OK", "application/json", "{\"ok\":true}"));
-        close(clientSock);
-        return;
-    }
-
-    if (method == "POST" && path == "/clear") {
-        std::lock_guard<std::mutex> lock(roomsMutex);
-        rooms[room].strokes.clear();
-        std::ostringstream event;
-        event << "{\"room\":\"" << jsonEscape(room) << "\"}";
-        broadcastSseLocked(room, "clear", event.str());
-        sendAll(clientSock, httpResponse("200 OK", "application/json", "{\"ok\":true}"));
-        close(clientSock);
-        return;
-    }
-
-    sendAll(clientSock, httpResponse("404 Not Found", "text/plain", "Not found"));
+    cleanupClientFromRooms(clientSock);
     close(clientSock);
 }
 
-void signalHandler(int) { running.store(false); }
-
-}  // namespace
-
-int main(int argc, char* argv[]) {
-    std::signal(SIGINT, signalHandler);
-
-    int port = 8080;
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
-    }
-
-    const int serverSock = socket(AF_INET, SOCK_STREAM, 0);
+int runServer(int port) {
+    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSock < 0) {
         std::cerr << "Failed to create socket\n";
         return 1;
@@ -418,19 +227,206 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "SharedWhiteboard single-program server running on port " << port << "\n";
+    std::cout << "SharedWhiteboard server mode running on port " << port << "\n";
+    std::cout << "Clients connect using this same EXE in client mode.\n";
 
-    while (running.load()) {
+    while (gRunning.load()) {
         sockaddr_in clientAddr{};
         socklen_t len = sizeof(clientAddr);
-        const int clientSock = accept(serverSock, reinterpret_cast<sockaddr*>(&clientAddr), &len);
+        int clientSock = accept(serverSock, reinterpret_cast<sockaddr*>(&clientAddr), &len);
         if (clientSock < 0) {
-            if (running.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (gRunning.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        std::thread(handleClient, clientSock).detach();
+        std::thread(handleServerClient, clientSock).detach();
     }
 
     close(serverSock);
     return 0;
+}
+
+void printBoard(const std::vector<std::string>& board) {
+    std::cout << "\n";
+    for (const auto& row : board) {
+        std::cout << row << "\n";
+    }
+    std::cout << std::flush;
+}
+
+int runClient(const std::string& host, int port, const std::string& room) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        std::cerr << "Failed to create socket\n";
+        return 1;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        std::cerr << "Invalid host IP\n";
+        close(sock);
+        return 1;
+    }
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "Failed to connect to " << host << ':' << port << "\n";
+        close(sock);
+        return 1;
+    }
+
+    std::mutex boardMutex;
+    std::vector<std::string> board(kBoardHeight, std::string(kBoardWidth, '.'));
+    std::atomic<bool> connected(true);
+
+    std::thread reader([&]() {
+        std::string line;
+        while (connected.load() && readLine(sock, line)) {
+            std::stringstream ss(line);
+            std::string head;
+            ss >> head;
+
+            if (head == "HELLO") {
+                int w = 0, h = 0;
+                ss >> w >> h;
+                std::cout << "Connected. Board size " << w << "x" << h << "\n";
+                continue;
+            }
+
+            if (head == "STATE") {
+                std::string payload;
+                std::getline(ss, payload);
+                payload = trim(payload);
+                std::lock_guard<std::mutex> lock(boardMutex);
+                board = boardFromWire(payload);
+                std::cout << "[state synced]\n";
+                printBoard(board);
+                continue;
+            }
+
+            if (head == "EVENT") {
+                std::string type;
+                ss >> type;
+                if (type == "DRAW") {
+                    int x = -1, y = -1;
+                    char mark = '#';
+                    ss >> x >> y >> mark;
+                    if (x >= 0 && x < kBoardWidth && y >= 0 && y < kBoardHeight) {
+                        std::lock_guard<std::mutex> lock(boardMutex);
+                        board[y][x] = mark;
+                        std::cout << "[draw " << x << ',' << y << "]\n";
+                    }
+                } else if (type == "CLEAR") {
+                    std::lock_guard<std::mutex> lock(boardMutex);
+                    board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
+                    std::cout << "[room cleared]\n";
+                }
+                continue;
+            }
+
+            if (head == "ERROR") {
+                std::string message;
+                std::getline(ss, message);
+                std::cout << "Server error:" << message << "\n";
+            }
+        }
+
+        connected.store(false);
+    });
+
+    sendLine(sock, "JOIN " + normalizeRoom(room));
+
+    std::cout << "Commands: draw x y [char], clear, show, room <name>, state, quit\n";
+    std::string input;
+    while (connected.load() && std::getline(std::cin, input)) {
+        const std::string cmdLine = trim(input);
+        if (cmdLine.empty()) continue;
+
+        std::stringstream ss(cmdLine);
+        std::string cmd;
+        ss >> cmd;
+
+        if (cmd == "draw") {
+            int x = -1, y = -1;
+            char mark = '#';
+            ss >> x >> y;
+            if (ss >> mark) {}
+            if (x < 0 || y < 0 || x >= kBoardWidth || y >= kBoardHeight) {
+                std::cout << "Invalid coordinates\n";
+                continue;
+            }
+            sendLine(sock, "DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, mark));
+            continue;
+        }
+
+        if (cmd == "clear") {
+            sendLine(sock, "CLEAR");
+            continue;
+        }
+
+        if (cmd == "show") {
+            std::lock_guard<std::mutex> lock(boardMutex);
+            printBoard(board);
+            continue;
+        }
+
+        if (cmd == "room") {
+            std::string newRoom;
+            ss >> newRoom;
+            if (newRoom.empty()) {
+                std::cout << "usage: room <name>\n";
+                continue;
+            }
+            sendLine(sock, "JOIN " + normalizeRoom(newRoom));
+            continue;
+        }
+
+        if (cmd == "state") {
+            sendLine(sock, "STATE");
+            continue;
+        }
+
+        if (cmd == "quit") {
+            sendLine(sock, "QUIT");
+            break;
+        }
+
+        std::cout << "Unknown command\n";
+    }
+
+    connected.store(false);
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
+    if (reader.joinable()) reader.join();
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    bool serverMode = false;
+    std::string host = "127.0.0.1";
+    int port = 5050;
+    std::string room = "main";
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--server") {
+            serverMode = true;
+        } else if (arg == "--host" && i + 1 < argc) {
+            host = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            port = std::stoi(argv[++i]);
+        } else if (arg == "--room" && i + 1 < argc) {
+            room = argv[++i];
+        } else if (arg == "--help") {
+            std::cout << "Usage:\n"
+                      << "  SharedWhiteboard.exe --server --port 5050\n"
+                      << "  SharedWhiteboard.exe --host 192.168.1.10 --port 5050 --room main\n";
+            return 0;
+        }
+    }
+
+    if (serverMode) return runServer(port);
+    return runClient(host, port, room);
 }
