@@ -1,43 +1,33 @@
-# Shared Whiteboard (Windows Single `.exe`, C++)
+# Shared Whiteboard (Windows GUI App, Single `.exe`)
 
-This is a Windows app (`SharedWhiteboard.exe`) with:
-- Server mode
-- Interactive UI client mode
-- Rooms with optional passwords
+You were right: now this is a **real Windows app window**, not terminal UI.
 
-## Why it was closing before
-If client mode starts and no server is running, the app exits quickly. Now it shows a clear error and (on Windows) waits for a key before closing.
+## What opens now
+- A GUI window with:
+  - Host / Port / Room / Password fields
+  - **Join**, **Create**, **Clear** buttons
+  - Click-and-draw board area
+- Press `P` to change pen (`#` / `@`).
 
-## Double-click launcher (Windows)
-If you run `SharedWhiteboard.exe` with no args, it now shows a launcher:
-1) Start Server
-2) Start Client UI
+## Run server
+```bat
+SharedWhiteboard.exe --server
+```
+(Hosts on port `5050`.)
+
+## Run client app window
+```bat
+SharedWhiteboard.exe
+```
+Then use Join/Create in the window.
+
+## Rooms with and without password
+- Create open room: leave Password empty + click **Create**
+- Create locked room: set Password + click **Create**
+- Join locked room: enter same Password + click **Join**
 
 ## Build on Windows (MinGW-w64)
 ```bat
 build_exe.bat
 ```
 Output: `SharedWhiteboard.exe`
-
-## Run directly with args
-Server:
-```bat
-SharedWhiteboard.exe --server --port 5050
-```
-Client UI:
-```bat
-SharedWhiteboard.exe --host <HOST_PC_IP> --port 5050 --room team1
-```
-
-## Room password options
-- `N` create room, set password or leave empty for open room
-- `J` join room, enter password if locked
-
-## UI controls
-- `W/A/S/D`: move cursor
-- `Space`: draw
-- `X`: clear room
-- `P`: switch pen char
-- `J`: join room (prompt)
-- `N`: create room (prompt)
-- `Q`: quit
