@@ -17,6 +17,6 @@ if %errorlevel% neq 0 (
 echo.
 echo Build complete: SharedWhiteboard.exe
 echo Run server: SharedWhiteboard.exe --server --port 5050
-echo Run client: SharedWhiteboard.exe --host 127.0.0.1 --port 5050 --room main
+echo Run UI client: SharedWhiteboard.exe --host 127.0.0.1 --port 5050 --room main
 echo Password room: SharedWhiteboard.exe --host 127.0.0.1 --port 5050 --room vip --password secret --create-room
 endlocal
