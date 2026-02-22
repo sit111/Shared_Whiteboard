@@ -18,8 +18,6 @@ constexpr SocketType kInvalidSocket = -1;
 
 #include <atomic>
 #include <cctype>
-#include <chrono>
-#include <cstring>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -29,9 +27,18 @@ constexpr SocketType kInvalidSocket = -1;
 #include <vector>
 
 namespace {
-
 constexpr int kBoardWidth = 60;
 constexpr int kBoardHeight = 20;
+
+void waitForExitMessage(const std::string& message) {
+#ifdef _WIN32
+    std::cout << message << "\nPress any key to close...";
+    std::cout.flush();
+    _getch();
+#else
+    std::cout << message << "\n";
+#endif
+}
 
 void closeSocket(SocketType s) {
 #ifdef _WIN32
@@ -164,10 +171,7 @@ bool attachLocked(SocketType sock, std::string& currentRoom, const std::string& 
     }
     if (!gRooms.count(room)) {
         RoomState rs;
-        if (!password.empty()) {
-            rs.hasPassword = true;
-            rs.password = password;
-        }
+        if (!password.empty()) { rs.hasPassword = true; rs.password = password; }
         gRooms[room] = rs;
     }
 
@@ -191,7 +195,6 @@ void handleClient(SocketType sock) {
         closeSocket(sock);
         return;
     }
-
     {
         std::lock_guard<std::mutex> lock(gRoomsMutex);
         if (!gRooms.count("main")) gRooms["main"] = RoomState{};
@@ -209,37 +212,27 @@ void handleClient(SocketType sock) {
         if (cmd == "JOIN" || cmd == "CREATE") {
             std::string target, pw;
             ss >> target >> pw;
-            if (target.empty()) {
-                sendLine(sock, "ERROR missing room name");
-                continue;
-            }
+            if (target.empty()) { sendLine(sock, "ERROR missing room name"); continue; }
             std::lock_guard<std::mutex> lock(gRoomsMutex);
             std::string err;
             if (!attachLocked(sock, room, target, pw, cmd == "CREATE", err)) sendLine(sock, "ERROR " + err);
             continue;
         }
-
         if (cmd == "DRAW") {
-            int x = -1, y = -1;
-            char mark = '#';
+            int x = -1, y = -1; char mark = '#';
             ss >> x >> y >> mark;
-            if (!ss || x < 0 || y < 0 || x >= kBoardWidth || y >= kBoardHeight) {
-                sendLine(sock, "ERROR invalid DRAW");
-                continue;
-            }
+            if (!ss || x < 0 || y < 0 || x >= kBoardWidth || y >= kBoardHeight) { sendLine(sock, "ERROR invalid DRAW"); continue; }
             std::lock_guard<std::mutex> lock(gRoomsMutex);
             gRooms[room].board[y][x] = mark;
             broadcastLocked(room, "EVENT DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, mark));
             continue;
         }
-
         if (cmd == "CLEAR") {
             std::lock_guard<std::mutex> lock(gRoomsMutex);
             gRooms[room].board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
             broadcastLocked(room, "EVENT CLEAR");
             continue;
         }
-
         if (cmd == "QUIT") break;
     }
 
@@ -345,13 +338,24 @@ std::string prompt(const std::string& label, RawMode& raw) {
 
 int runClient(const std::string& host, int port, const std::string& room, const std::string& password, bool createRoom) {
     SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == kInvalidSocket) return 1;
+    if (sock == kInvalidSocket) {
+        waitForExitMessage("Failed to create socket.");
+        return 1;
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) return 1;
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) return 1;
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        closeSocket(sock);
+        waitForExitMessage("Invalid host IP address.");
+        return 1;
+    }
+    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        closeSocket(sock);
+        waitForExitMessage("Could not connect. Start server first: SharedWhiteboard.exe --server --port 5050");
+        return 1;
+    }
 
     UiState ui;
     std::mutex mu;
@@ -376,8 +380,7 @@ int runClient(const std::string& host, int port, const std::string& room, const 
                 std::string kind;
                 ss >> kind;
                 if (kind == "DRAW") {
-                    int x, y;
-                    char mark;
+                    int x, y; char mark;
                     ss >> x >> y >> mark;
                     if (x >= 0 && x < kBoardWidth && y >= 0 && y < kBoardHeight) ui.board[y][x] = mark;
                     ui.info = "draw";
@@ -454,6 +457,43 @@ int main(int argc, char* argv[]) {
     int port = 5050;
     std::string room = "main";
     std::string password;
+
+#ifdef _WIN32
+    if (argc == 1) {
+        std::cout << "SharedWhiteboard Launcher\n1) Start Server\n2) Start Client UI\nChoose (1/2): ";
+        int choice = _getch();
+        std::cout << static_cast<char>(choice) << "\n";
+        if (choice == '1') {
+            serverMode = true;
+            std::cout << "Port (default 5050): ";
+            std::string p;
+            std::getline(std::cin, p);
+            p = trim(p);
+            if (!p.empty()) port = std::stoi(p);
+        } else {
+            std::cout << "Host (default 127.0.0.1): ";
+            std::getline(std::cin, host);
+            host = trim(host);
+            if (host.empty()) host = "127.0.0.1";
+            std::cout << "Port (default 5050): ";
+            std::string p;
+            std::getline(std::cin, p);
+            p = trim(p);
+            if (!p.empty()) port = std::stoi(p);
+            std::cout << "Room (default main): ";
+            std::getline(std::cin, room);
+            room = trim(room);
+            if (room.empty()) room = "main";
+            std::cout << "Create room? (y/N): ";
+            std::string c;
+            std::getline(std::cin, c);
+            createRoom = !c.empty() && (c[0] == 'y' || c[0] == 'Y');
+            std::cout << "Password (optional): ";
+            std::getline(std::cin, password);
+            password = trim(password);
+        }
+    }
+#endif
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
