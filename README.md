@@ -1,37 +1,43 @@
-# Shared Whiteboard (Single `.exe` Program, C++)
+# Shared Whiteboard (Windows Single `.exe`, C++)
 
-This is a **program UI** version (not website). One executable runs server or interactive client UI.
+This is built for **Windows** as one program (`SharedWhiteboard.exe`) with:
+- Server mode
+- Interactive in-app UI client mode
+- Rooms with optional passwords
 
-## Build on Windows
+## Build on Windows (MinGW-w64)
 ```bat
 build_exe.bat
 ```
 Output: `SharedWhiteboard.exe`
 
-## Run server
+## Run server on Windows PC
 ```bat
 SharedWhiteboard.exe --server --port 5050
 ```
 
-## Run UI client
+## Run UI client on another Windows PC
 ```bat
 SharedWhiteboard.exe --host <HOST_PC_IP> --port 5050 --room team1
 ```
 
-## Rooms with/without passwords
-- Create open room: press `N`, room name, empty password
-- Create locked room: press `N`, room name, set password
-- Join room: press `J`, room name, enter password if needed
-- CLI startup flags also work:
-```bat
-SharedWhiteboard.exe --host <HOST_PC_IP> --port 5050 --room vip --password secret --create-room
-```
+## Room password options in UI
+- `N` create room, set password or leave empty for open room
+- `J` join room, enter password if room is locked
 
 ## UI controls
 - `W/A/S/D`: move cursor
-- `Space`: draw with current pen
-- `P`: toggle pen char (`#` / `@`)
+- `Space`: draw
 - `X`: clear room
+- `P`: switch pen char
 - `J`: join room (prompt)
 - `N`: create room (prompt)
 - `Q`: quit
+
+## CLI flags
+- `--server`
+- `--host <ip>`
+- `--port <num>`
+- `--room <name>`
+- `--password <pwd>`
+- `--create-room`

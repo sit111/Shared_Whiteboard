@@ -1,12 +1,24 @@
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0601
+#include <conio.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+using SocketType = SOCKET;
+constexpr SocketType kInvalidSocket = INVALID_SOCKET;
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
+using SocketType = int;
+constexpr SocketType kInvalidSocket = -1;
+#endif
 
 #include <atomic>
 #include <cctype>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -16,29 +28,44 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
-#include <termios.h>
-#else
-#include <conio.h>
-#endif
-
 namespace {
 
 constexpr int kBoardWidth = 60;
 constexpr int kBoardHeight = 20;
 
+void closeSocket(SocketType s) {
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+}
+
+bool initSockets() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+#else
+    return true;
+#endif
+}
+
+void cleanupSockets() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
 struct RoomState {
     std::vector<std::string> board;
-    std::vector<int> clients;
+    std::vector<SocketType> clients;
     bool hasPassword = false;
     std::string password;
-
     RoomState() : board(kBoardHeight, std::string(kBoardWidth, '.')) {}
 };
 
 std::mutex gRoomsMutex;
 std::map<std::string, RoomState> gRooms;
-std::atomic<bool> gRunning(true);
 
 std::string trim(const std::string& s) {
     size_t start = 0;
@@ -55,27 +82,35 @@ std::string normalizeRoom(const std::string& room) {
     return out;
 }
 
-bool sendAll(int sock, const std::string& data) {
+bool sendAll(SocketType sock, const std::string& data) {
     size_t sent = 0;
     while (sent < data.size()) {
-        const ssize_t n = send(sock, data.data() + sent, data.size() - sent, 0);
+#ifdef _WIN32
+        int n = send(sock, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+#else
+        ssize_t n = send(sock, data.data() + sent, data.size() - sent, 0);
+#endif
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
     return true;
 }
 
-bool sendLine(int sock, const std::string& line) { return sendAll(sock, line + "\n"); }
+bool sendLine(SocketType sock, const std::string& line) { return sendAll(sock, line + "\n"); }
 
-bool readLine(int sock, std::string& lineOut) {
-    lineOut.clear();
+bool readLine(SocketType sock, std::string& out) {
+    out.clear();
     char ch;
     while (true) {
-        const ssize_t n = recv(sock, &ch, 1, 0);
+#ifdef _WIN32
+        int n = recv(sock, &ch, 1, 0);
+#else
+        ssize_t n = recv(sock, &ch, 1, 0);
+#endif
         if (n <= 0) return false;
         if (ch == '\n') return true;
-        if (ch != '\r') lineOut.push_back(ch);
-        if (lineOut.size() > 8192) return false;
+        if (ch != '\r') out.push_back(ch);
+        if (out.size() > 8192) return false;
     }
 }
 
@@ -102,107 +137,85 @@ std::vector<std::string> boardFromWire(const std::string& payload) {
     return board;
 }
 
-void cleanupClientFromRooms(int clientSock) {
-    std::lock_guard<std::mutex> lock(gRoomsMutex);
+void removeClientLocked(SocketType sock) {
     for (auto& [_, room] : gRooms) {
-        std::vector<int> keep;
-        for (int c : room.clients) {
-            if (c != clientSock) keep.push_back(c);
-        }
+        std::vector<SocketType> keep;
+        for (SocketType c : room.clients) if (c != sock) keep.push_back(c);
         room.clients.swap(keep);
     }
 }
 
-void broadcastToRoomLocked(const std::string& roomName, const std::string& line) {
-    auto& room = gRooms[roomName];
-    std::vector<int> alive;
-    for (int c : room.clients) {
-        if (sendLine(c, line)) {
-            alive.push_back(c);
-        } else {
-            close(c);
-        }
+void broadcastLocked(const std::string& room, const std::string& msg) {
+    auto& clients = gRooms[room].clients;
+    std::vector<SocketType> alive;
+    for (SocketType c : clients) {
+        if (sendLine(c, msg)) alive.push_back(c);
+        else closeSocket(c);
     }
-    room.clients.swap(alive);
+    clients.swap(alive);
 }
 
-bool attachClientToRoomLocked(int clientSock, std::string& activeRoom, const std::string& roomName, const std::string& providedPassword,
-                              bool createMode, std::string& errorOut) {
-    const std::string normalized = normalizeRoom(roomName);
-
-    if (createMode) {
-        if (gRooms.count(normalized)) {
-            errorOut = "room already exists";
-            return false;
+bool attachLocked(SocketType sock, std::string& currentRoom, const std::string& targetRoom, const std::string& password,
+                  bool create, std::string& err) {
+    const std::string room = normalizeRoom(targetRoom);
+    if (create && gRooms.count(room)) {
+        err = "room already exists";
+        return false;
+    }
+    if (!gRooms.count(room)) {
+        RoomState rs;
+        if (!password.empty()) {
+            rs.hasPassword = true;
+            rs.password = password;
         }
-        RoomState room;
-        if (!providedPassword.empty()) {
-            room.hasPassword = true;
-            room.password = providedPassword;
-        }
-        gRooms[normalized] = room;
-    } else if (!gRooms.count(normalized)) {
-        RoomState room;
-        if (!providedPassword.empty()) {
-            room.hasPassword = true;
-            room.password = providedPassword;
-        }
-        gRooms[normalized] = room;
+        gRooms[room] = rs;
     }
 
-    auto& target = gRooms[normalized];
-    if (target.hasPassword && target.password != providedPassword) {
-        errorOut = "wrong password";
+    auto& r = gRooms[room];
+    if (r.hasPassword && r.password != password) {
+        err = "wrong password";
         return false;
     }
 
-    auto& oldClients = gRooms[activeRoom].clients;
-    std::vector<int> keep;
-    for (int c : oldClients) {
-        if (c != clientSock) keep.push_back(c);
-    }
-    oldClients.swap(keep);
-
-    activeRoom = normalized;
-    target.clients.push_back(clientSock);
-    sendLine(clientSock, std::string("ROOM ") + activeRoom + (target.hasPassword ? " locked" : " open"));
-    sendLine(clientSock, "STATE " + boardToWire(target.board));
+    removeClientLocked(sock);
+    currentRoom = room;
+    r.clients.push_back(sock);
+    sendLine(sock, "ROOM " + room + (r.hasPassword ? " locked" : " open"));
+    sendLine(sock, "STATE " + boardToWire(r.board));
     return true;
 }
 
-void handleServerClient(int clientSock) {
-    std::string roomName = "main";
-    if (!sendLine(clientSock, "HELLO 60 20")) {
-        close(clientSock);
+void handleClient(SocketType sock) {
+    std::string room = "main";
+    if (!sendLine(sock, "HELLO 60 20")) {
+        closeSocket(sock);
         return;
     }
 
     {
         std::lock_guard<std::mutex> lock(gRoomsMutex);
         if (!gRooms.count("main")) gRooms["main"] = RoomState{};
-        gRooms["main"].clients.push_back(clientSock);
-        sendLine(clientSock, "ROOM main open");
-        sendLine(clientSock, "STATE " + boardToWire(gRooms["main"].board));
+        gRooms["main"].clients.push_back(sock);
+        sendLine(sock, "ROOM main open");
+        sendLine(sock, "STATE " + boardToWire(gRooms["main"].board));
     }
 
     std::string line;
-    while (readLine(clientSock, line)) {
+    while (readLine(sock, line)) {
         std::stringstream ss(line);
         std::string cmd;
         ss >> cmd;
 
         if (cmd == "JOIN" || cmd == "CREATE") {
-            std::string newRoom, password;
-            ss >> newRoom >> password;
-            if (newRoom.empty()) {
-                sendLine(clientSock, std::string("ERROR usage: ") + (cmd == "CREATE" ? "CREATE room [password]" : "JOIN room [password]"));
+            std::string target, pw;
+            ss >> target >> pw;
+            if (target.empty()) {
+                sendLine(sock, "ERROR missing room name");
                 continue;
             }
             std::lock_guard<std::mutex> lock(gRoomsMutex);
-            std::string error;
-            if (!attachClientToRoomLocked(clientSock, roomName, newRoom, password, cmd == "CREATE", error)) {
-                sendLine(clientSock, "ERROR " + error);
-            }
+            std::string err;
+            if (!attachLocked(sock, room, target, pw, cmd == "CREATE", err)) sendLine(sock, "ERROR " + err);
             continue;
         }
 
@@ -211,59 +224,59 @@ void handleServerClient(int clientSock) {
             char mark = '#';
             ss >> x >> y >> mark;
             if (!ss || x < 0 || y < 0 || x >= kBoardWidth || y >= kBoardHeight) {
-                sendLine(clientSock, "ERROR invalid DRAW");
+                sendLine(sock, "ERROR invalid DRAW");
                 continue;
             }
             std::lock_guard<std::mutex> lock(gRoomsMutex);
-            gRooms[roomName].board[y][x] = mark;
-            broadcastToRoomLocked(roomName, "EVENT DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, mark));
+            gRooms[room].board[y][x] = mark;
+            broadcastLocked(room, "EVENT DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, mark));
             continue;
         }
 
         if (cmd == "CLEAR") {
             std::lock_guard<std::mutex> lock(gRoomsMutex);
-            gRooms[roomName].board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
-            broadcastToRoomLocked(roomName, "EVENT CLEAR");
-            continue;
-        }
-
-        if (cmd == "STATE") {
-            std::lock_guard<std::mutex> lock(gRoomsMutex);
-            sendLine(clientSock, "STATE " + boardToWire(gRooms[roomName].board));
+            gRooms[room].board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
+            broadcastLocked(room, "EVENT CLEAR");
             continue;
         }
 
         if (cmd == "QUIT") break;
-        sendLine(clientSock, "ERROR unknown command");
     }
 
-    cleanupClientFromRooms(clientSock);
-    close(clientSock);
+    {
+        std::lock_guard<std::mutex> lock(gRoomsMutex);
+        removeClientLocked(sock);
+    }
+    closeSocket(sock);
 }
 
 int runServer(int port) {
-    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSock < 0) return 1;
+    SocketType serverSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSock == kInvalidSocket) return 1;
+
     int opt = 1;
-    setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(static_cast<uint16_t>(port));
+
     if (bind(serverSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) return 1;
     if (listen(serverSock, 64) < 0) return 1;
 
     std::cout << "Server running on port " << port << "\n";
-    while (gRunning.load()) {
-        sockaddr_in clientAddr{};
-        socklen_t len = sizeof(clientAddr);
-        int clientSock = accept(serverSock, reinterpret_cast<sockaddr*>(&clientAddr), &len);
-        if (clientSock < 0) continue;
-        std::thread(handleServerClient, clientSock).detach();
+    while (true) {
+        sockaddr_in caddr{};
+#ifdef _WIN32
+        int len = sizeof(caddr);
+#else
+        socklen_t len = sizeof(caddr);
+#endif
+        SocketType c = accept(serverSock, reinterpret_cast<sockaddr*>(&caddr), &len);
+        if (c == kInvalidSocket) continue;
+        std::thread(handleClient, c).detach();
     }
-    close(serverSock);
-    return 0;
 }
 
 struct UiState {
@@ -271,8 +284,8 @@ struct UiState {
     std::string room = "main";
     std::string mode = "open";
     std::string info = "connected";
-    int cursorX = 0;
-    int cursorY = 0;
+    int x = 0;
+    int y = 0;
     char pen = '#';
 };
 
@@ -280,8 +293,8 @@ struct UiState {
 struct RawMode {
     termios old{};
     bool enabled = false;
-    explicit RawMode(bool on = true) {
-        if (!on) return;
+    void enable() {
+        if (enabled) return;
         if (tcgetattr(STDIN_FILENO, &old) == 0) {
             termios raw = old;
             raw.c_lflag &= static_cast<unsigned long>(~(ICANON | ECHO));
@@ -289,53 +302,50 @@ struct RawMode {
             enabled = true;
         }
     }
-    ~RawMode() {
-        if (enabled) tcsetattr(STDIN_FILENO, TCSANOW, &old);
+    void disable() {
+        if (enabled) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &old);
+            enabled = false;
+        }
     }
+    ~RawMode() { disable(); }
 };
-
 int readKey() {
     char c = 0;
     if (::read(STDIN_FILENO, &c, 1) <= 0) return -1;
     return static_cast<unsigned char>(c);
 }
 #else
-struct RawMode { explicit RawMode(bool = true) {} };
+struct RawMode { void enable() {} void disable() {} };
 int readKey() { return _getch(); }
 #endif
 
-void renderUi(const UiState& ui) {
+void render(const UiState& ui) {
     std::cout << "\x1b[2J\x1b[H";
-    std::cout << "Shared Whiteboard UI | room=" << ui.room << " (" << ui.mode << ") | pen=" << ui.pen << "\n";
-    std::cout << "WASD move  SPACE draw  X clear  J join  N new room  P pen  Q quit\n";
+    std::cout << "Shared Whiteboard UI (Windows-ready) | room=" << ui.room << " (" << ui.mode << ")\n";
+    std::cout << "WASD move SPACE draw X clear P pen J join N create Q quit\n";
     std::cout << "Status: " << ui.info << "\n";
-
     for (int y = 0; y < kBoardHeight; ++y) {
         for (int x = 0; x < kBoardWidth; ++x) {
-            if (x == ui.cursorX && y == ui.cursorY) {
-                std::cout << '[' << ui.board[y][x] << ']';
-            } else {
-                std::cout << ' ' << ui.board[y][x] << ' ';
-            }
+            if (x == ui.x && y == ui.y) std::cout << '[' << ui.board[y][x] << ']';
+            else std::cout << ' ' << ui.board[y][x] << ' ';
         }
         std::cout << "\n";
     }
-    std::cout.flush();
 }
 
-std::string promptLine(const std::string& label) {
-#ifndef _WIN32
-    RawMode off(false);
-#endif
+std::string prompt(const std::string& label, RawMode& raw) {
+    raw.disable();
     std::cout << "\n" << label;
     std::string s;
     std::getline(std::cin, s);
+    raw.enable();
     return trim(s);
 }
 
 int runClient(const std::string& host, int port, const std::string& room, const std::string& password, bool createRoom) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return 1;
+    SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == kInvalidSocket) return 1;
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -344,16 +354,16 @@ int runClient(const std::string& host, int port, const std::string& room, const 
     if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) return 1;
 
     UiState ui;
-    std::mutex uiMutex;
-    std::atomic<bool> connected(true);
+    std::mutex mu;
+    std::atomic<bool> live(true);
 
     std::thread reader([&]() {
         std::string line;
-        while (connected.load() && readLine(sock, line)) {
+        while (live.load() && readLine(sock, line)) {
             std::stringstream ss(line);
             std::string head;
             ss >> head;
-            std::lock_guard<std::mutex> lock(uiMutex);
+            std::lock_guard<std::mutex> lock(mu);
             if (head == "ROOM") {
                 ss >> ui.room >> ui.mode;
                 ui.info = "joined room";
@@ -370,85 +380,74 @@ int runClient(const std::string& host, int port, const std::string& room, const 
                     char mark;
                     ss >> x >> y >> mark;
                     if (x >= 0 && x < kBoardWidth && y >= 0 && y < kBoardHeight) ui.board[y][x] = mark;
-                    ui.info = "draw event";
+                    ui.info = "draw";
                 } else if (kind == "CLEAR") {
                     ui.board.assign(kBoardHeight, std::string(kBoardWidth, '.'));
-                    ui.info = "room cleared";
+                    ui.info = "cleared";
                 }
             } else if (head == "ERROR") {
-                std::string msg;
-                std::getline(ss, msg);
-                ui.info = "error: " + trim(msg);
+                std::string m;
+                std::getline(ss, m);
+                ui.info = "error: " + trim(m);
             }
         }
-        connected.store(false);
+        live.store(false);
     });
 
-    std::string boot = createRoom ? "CREATE " : "JOIN ";
-    boot += normalizeRoom(room);
+    std::string boot = (createRoom ? "CREATE " : "JOIN ") + normalizeRoom(room);
     if (!password.empty()) boot += " " + password;
     sendLine(sock, boot);
 
-    RawMode raw(true);
-    while (connected.load()) {
+    RawMode raw;
+    raw.enable();
+    while (live.load()) {
         {
-            std::lock_guard<std::mutex> lock(uiMutex);
-            renderUi(ui);
+            std::lock_guard<std::mutex> lock(mu);
+            render(ui);
         }
-
         int key = readKey();
         if (key < 0) break;
         char c = static_cast<char>(std::tolower(key));
-
-        std::lock_guard<std::mutex> lock(uiMutex);
-        if (c == 'q') {
-            sendLine(sock, "QUIT");
-            break;
-        } else if (c == 'w' && ui.cursorY > 0) {
-            ui.cursorY--;
-        } else if (c == 's' && ui.cursorY < kBoardHeight - 1) {
-            ui.cursorY++;
-        } else if (c == 'a' && ui.cursorX > 0) {
-            ui.cursorX--;
-        } else if (c == 'd' && ui.cursorX < kBoardWidth - 1) {
-            ui.cursorX++;
-        } else if (c == ' ') {
-            sendLine(sock, "DRAW " + std::to_string(ui.cursorX) + " " + std::to_string(ui.cursorY) + " " + std::string(1, ui.pen));
-        } else if (c == 'x') {
-            sendLine(sock, "CLEAR");
-        } else if (c == 'p') {
-            ui.info = "pen changed";
-            ui.pen = (ui.pen == '#') ? '@' : '#';
-        } else if (c == 'j' || c == 'n') {
-#ifndef _WIN32
-            raw.~RawMode();
-            new (&raw) RawMode(false);
-#endif
-            std::string target = promptLine(c == 'j' ? "Join room: " : "Create room: ");
-            std::string pass = promptLine("Password (empty for open): ");
-#ifndef _WIN32
-            raw.~RawMode();
-            new (&raw) RawMode(true);
-#endif
-            if (!target.empty()) {
-                std::string cmd = (c == 'j' ? "JOIN " : "CREATE ") + normalizeRoom(target);
-                if (!pass.empty()) cmd += " " + pass;
+        std::lock_guard<std::mutex> lock(mu);
+        if (c == 'q') { sendLine(sock, "QUIT"); break; }
+        if (c == 'w' && ui.y > 0) ui.y--;
+        else if (c == 's' && ui.y < kBoardHeight - 1) ui.y++;
+        else if (c == 'a' && ui.x > 0) ui.x--;
+        else if (c == 'd' && ui.x < kBoardWidth - 1) ui.x++;
+        else if (c == ' ') sendLine(sock, "DRAW " + std::to_string(ui.x) + " " + std::to_string(ui.y) + " " + std::string(1, ui.pen));
+        else if (c == 'x') sendLine(sock, "CLEAR");
+        else if (c == 'p') ui.pen = (ui.pen == '#') ? '@' : '#';
+        else if (c == 'j' || c == 'n') {
+            std::string r = prompt(c == 'j' ? "Join room: " : "Create room: ", raw);
+            std::string pw = prompt("Password (empty for open): ", raw);
+            if (!r.empty()) {
+                std::string cmd = (c == 'j' ? "JOIN " : "CREATE ") + normalizeRoom(r);
+                if (!pw.empty()) cmd += " " + pw;
                 sendLine(sock, cmd);
             }
         }
     }
 
-    connected.store(false);
+    raw.disable();
+    live.store(false);
+#ifdef _WIN32
+    shutdown(sock, SD_BOTH);
+#else
     shutdown(sock, SHUT_RDWR);
-    close(sock);
+#endif
+    closeSocket(sock);
     if (reader.joinable()) reader.join();
-    std::cout << "\nDisconnected.\n";
     return 0;
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    if (!initSockets()) {
+        std::cerr << "Socket init failed\n";
+        return 1;
+    }
+
     bool serverMode = false;
     bool createRoom = false;
     std::string host = "127.0.0.1";
@@ -464,14 +463,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--room" && i + 1 < argc) room = argv[++i];
         else if (arg == "--password" && i + 1 < argc) password = argv[++i];
         else if (arg == "--create-room") createRoom = true;
-        else if (arg == "--help") {
-            std::cout << "Usage:\n"
-                      << "  SharedWhiteboard.exe --server --port 5050\n"
-                      << "  SharedWhiteboard.exe --host 192.168.1.10 --port 5050 --room team [--password secret] [--create-room]\n";
-            return 0;
-        }
     }
 
-    if (serverMode) return runServer(port);
-    return runClient(host, port, room, password, createRoom);
+    const int code = serverMode ? runServer(port) : runClient(host, port, room, password, createRoom);
+    cleanupSockets();
+    return code;
 }

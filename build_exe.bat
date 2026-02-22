@@ -7,8 +7,8 @@ if %errorlevel% neq 0 (
   exit /b 1
 )
 
-echo Building SharedWhiteboard.exe from C++ source...
-g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -o SharedWhiteboard.exe
+echo Building Windows SharedWhiteboard.exe ...
+g++ -std=c++17 -O2 -pthread whiteboard_server.cpp -lws2_32 -o SharedWhiteboard.exe
 if %errorlevel% neq 0 (
   echo [ERROR] Build failed.
   exit /b 1
