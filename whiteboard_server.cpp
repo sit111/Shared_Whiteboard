@@ -5,20 +5,33 @@
 #include <windows.h>
 #pragma comment(lib, "Ws2_32.lib")
 
-#include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
-#include <memory>
 
 namespace {
-constexpr int BOARD_W = 60;
-constexpr int BOARD_H = 20;
-constexpr int CELL = 14;
+constexpr int BOARD_W = 64;
+constexpr int BOARD_H = 36;
+constexpr int TOOLBAR_H = 92;
+constexpr int CELL = 16;
 constexpr UINT WM_NET_LINE = WM_APP + 1;
+
+enum : int {
+    ID_HOST = 101,
+    ID_PORT,
+    ID_ROOM,
+    ID_PASS,
+    ID_JOIN,
+    ID_CREATE,
+    ID_CLEAR,
+    ID_PEN,
+    ID_STATUS,
+    ID_ACTIVE_ROOM
+};
 
 struct RoomState {
     std::vector<std::string> board = std::vector<std::string>(BOARD_H, std::string(BOARD_W, '.'));
@@ -103,7 +116,8 @@ void broadcastLocked(const std::string& roomName, const std::string& msg) {
 }
 
 bool attachLocked(SOCKET s, std::string& currentRoom, const std::string& targetRoom, const std::string& pw, bool create, std::string& err) {
-    std::string room = trim(targetRoom); if (room.empty()) room = "main";
+    std::string room = trim(targetRoom);
+    if (room.empty()) room = "main";
     if (create && g_rooms.count(room)) { err = "room already exists"; return false; }
     if (!g_rooms.count(room)) {
         RoomState rs;
@@ -122,7 +136,7 @@ bool attachLocked(SOCKET s, std::string& currentRoom, const std::string& targetR
 
 void serverClientThread(SOCKET s) {
     std::string room = "main";
-    sendLine(s, "HELLO 60 20");
+    sendLine(s, "HELLO");
     {
         std::lock_guard<std::mutex> lk(g_roomsMutex);
         if (!g_rooms.count("main")) g_rooms["main"] = RoomState{};
@@ -130,9 +144,12 @@ void serverClientThread(SOCKET s) {
         sendLine(s, "ROOM main open");
         sendLine(s, "STATE " + boardToWire(g_rooms["main"].board));
     }
+
     std::string line;
     while (readLine(s, line)) {
-        std::stringstream ss(line); std::string cmd; ss >> cmd;
+        std::stringstream ss(line);
+        std::string cmd;
+        ss >> cmd;
         if (cmd == "JOIN" || cmd == "CREATE") {
             std::string r, p; ss >> r >> p;
             std::lock_guard<std::mutex> lk(g_roomsMutex);
@@ -141,10 +158,10 @@ void serverClientThread(SOCKET s) {
             continue;
         }
         if (cmd == "DRAW") {
-            int x=-1,y=-1; char m='#'; ss>>x>>y>>m;
-            if (x<0||x>=BOARD_W||y<0||y>=BOARD_H) continue;
+            int x=-1, y=-1; char m='#'; ss >> x >> y >> m;
+            if (x < 0 || x >= BOARD_W || y < 0 || y >= BOARD_H) continue;
             std::lock_guard<std::mutex> lk(g_roomsMutex);
-            g_rooms[room].board[y][x]=m;
+            g_rooms[room].board[y][x] = m;
             broadcastLocked(room, "EVENT DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1,m));
             continue;
         }
@@ -156,6 +173,7 @@ void serverClientThread(SOCKET s) {
         }
         if (cmd == "QUIT") break;
     }
+
     {
         std::lock_guard<std::mutex> lk(g_roomsMutex);
         removeClientLocked(s);
@@ -171,7 +189,7 @@ int runServer(int port) {
     sockaddr_in a{}; a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY; a.sin_port=htons((u_short)port);
     if (bind(ss,(sockaddr*)&a,sizeof(a))<0) return 1;
     if (listen(ss,64)<0) return 1;
-    MessageBoxA(nullptr, "Server is running on selected port. Keep this app open.", "SharedWhiteboard Server", MB_OK);
+    MessageBoxA(nullptr, "Server started. Keep this window open while people connect.", "SharedWhiteboard Server", MB_OK | MB_ICONINFORMATION);
     while (true) {
         sockaddr_in ca{}; int len=sizeof(ca);
         SOCKET c=accept(ss,(sockaddr*)&ca,&len);
@@ -182,52 +200,74 @@ int runServer(int port) {
 
 struct ClientApp {
     HWND hwnd{};
-    HWND eHost{}, ePort{}, eRoom{}, ePass{}, lbl{};
+    HWND eHost{}, ePort{}, eRoom{}, ePass{}, lblStatus{}, lblRoom{}, btnPen{};
     SOCKET sock = INVALID_SOCKET;
     std::thread reader;
-    std::mutex mu;
     std::vector<std::string> board = std::vector<std::string>(BOARD_H, std::string(BOARD_W, '.'));
-    std::string room = "main";
+    std::string activeRoom = "none";
+    std::string roomMode = "open";
     char pen = '#';
     bool connected = false;
 } g_app;
 
 void setStatus(const std::string& s) {
-    SetWindowTextA(g_app.lbl, s.c_str());
+    SetWindowTextA(g_app.lblStatus, s.c_str());
+}
+
+void setActiveRoom(const std::string& room, const std::string& mode) {
+    g_app.activeRoom = room;
+    g_app.roomMode = mode;
+    std::string line = "Active Room: " + room + " (" + mode + ")";
+    SetWindowTextA(g_app.lblRoom, line.c_str());
 }
 
 std::string getText(HWND h) {
-    char buf[256]; GetWindowTextA(h, buf, sizeof(buf)); return std::string(buf);
+    char b[256]{};
+    GetWindowTextA(h, b, sizeof(b));
+    return std::string(b);
 }
 
-bool clientConnectAndJoin(bool createMode) {
+void closeClientConnection() {
     if (g_app.connected) {
-        closesocket(g_app.sock);
-        if (g_app.reader.joinable()) g_app.reader.join();
         g_app.connected = false;
+        shutdown(g_app.sock, SD_BOTH);
+        closesocket(g_app.sock);
     }
+    if (g_app.reader.joinable()) g_app.reader.join();
+    g_app.sock = INVALID_SOCKET;
+}
 
-    std::string host = trim(getText(g_app.eHost)); if (host.empty()) host = "127.0.0.1";
+bool clientConnectAndRoom(bool createMode) {
+    closeClientConnection();
+
+    const std::string host = trim(getText(g_app.eHost)).empty() ? "127.0.0.1" : trim(getText(g_app.eHost));
     int port = atoi(getText(g_app.ePort).c_str()); if (port <= 0) port = 5050;
-    std::string room = trim(getText(g_app.eRoom)); if (room.empty()) room = "main";
-    std::string pass = trim(getText(g_app.ePass));
+    const std::string room = trim(getText(g_app.eRoom)).empty() ? "main" : trim(getText(g_app.eRoom));
+    const std::string pass = trim(getText(g_app.ePass));
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) { setStatus("Socket create failed"); return false; }
+
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
-    if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) <= 0) { closesocket(s); setStatus("Invalid host"); return false; }
-    if (connect(s, (sockaddr*)&a, sizeof(a)) < 0) { closesocket(s); setStatus("Connect failed (start server first)"); return false; }
+    if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) <= 0) {
+        closesocket(s); setStatus("Invalid host"); return false;
+    }
+    if (connect(s, (sockaddr*)&a, sizeof(a)) < 0) {
+        closesocket(s); setStatus("Cannot connect. Start server first."); return false;
+    }
 
     g_app.sock = s;
     g_app.connected = true;
+    setStatus("Connected. Joining room...");
+
     g_app.reader = std::thread([] {
         std::string line;
         while (g_app.connected && readLine(g_app.sock, line)) {
-            auto* heap = new std::string(line);
-            PostMessage(g_app.hwnd, WM_NET_LINE, 0, (LPARAM)heap);
+            PostMessage(g_app.hwnd, WM_NET_LINE, 0, (LPARAM)new std::string(line));
         }
-        g_app.connected = false;
-        PostMessage(g_app.hwnd, WM_NET_LINE, 0, (LPARAM)new std::string("ERROR disconnected"));
+        if (g_app.connected) {
+            PostMessage(g_app.hwnd, WM_NET_LINE, 0, (LPARAM)new std::string("ERROR disconnected"));
+        }
     });
 
     std::string cmd = std::string(createMode ? "CREATE " : "JOIN ") + room;
@@ -236,111 +276,195 @@ bool clientConnectAndJoin(bool createMode) {
     return true;
 }
 
-void drawCell(HDC hdc, int x, int y, char ch, bool cursor) {
-    RECT r{ x * CELL, y * CELL + 80, x * CELL + CELL, y * CELL + 80 + CELL };
-    HBRUSH b = CreateSolidBrush(cursor ? RGB(210,230,255) : RGB(255,255,255));
-    FillRect(hdc, &r, b); DeleteObject(b);
-    Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-    if (ch != '.') {
-        char t[2]{ch,0};
-        SetTextColor(hdc, RGB(30,30,30));
-        SetBkMode(hdc, TRANSPARENT);
-        TextOutA(hdc, r.left + 4, r.top + 1, t, 1);
+void drawBoard(HDC hdc, RECT clientRect) {
+    RECT boardRect{8, TOOLBAR_H, 8 + BOARD_W * CELL, TOOLBAR_H + BOARD_H * CELL};
+    HBRUSH bg = CreateSolidBrush(RGB(250, 251, 255));
+    FillRect(hdc, &boardRect, bg);
+    DeleteObject(bg);
+
+    HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(220, 226, 236));
+    HGDIOBJ oldPen = SelectObject(hdc, gridPen);
+
+    for (int x = 0; x <= BOARD_W; ++x) {
+        MoveToEx(hdc, boardRect.left + x * CELL, boardRect.top, nullptr);
+        LineTo(hdc, boardRect.left + x * CELL, boardRect.bottom);
     }
+    for (int y = 0; y <= BOARD_H; ++y) {
+        MoveToEx(hdc, boardRect.left, boardRect.top + y * CELL, nullptr);
+        LineTo(hdc, boardRect.right, boardRect.top + y * CELL);
+    }
+
+    SelectObject(hdc, oldPen);
+    DeleteObject(gridPen);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(35, 40, 50));
+    for (int y = 0; y < BOARD_H; ++y) {
+        for (int x = 0; x < BOARD_W; ++x) {
+            char c = g_app.board[y][x];
+            if (c == '.') continue;
+            char t[2]{c, 0};
+            TextOutA(hdc, boardRect.left + x * CELL + 4, boardRect.top + y * CELL + 1, t, 1);
+        }
+    }
+
+    RECT tip{boardRect.left, boardRect.bottom + 8, clientRect.right - 10, boardRect.bottom + 30};
+    DrawTextA(hdc, "Draw with mouse drag. Press P to switch pen (#/@).", -1, &tip, DT_LEFT | DT_SINGLELINE);
 }
 
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    static int cx = 0, cy = 0;
     switch (m) {
         case WM_CREATE: {
-            CreateWindowA("STATIC", "Host", WS_CHILD|WS_VISIBLE, 8,8,35,20,h,nullptr,nullptr,nullptr);
-            g_app.eHost=CreateWindowA("EDIT", "127.0.0.1", WS_CHILD|WS_VISIBLE|WS_BORDER, 45,8,100,20,h,nullptr,nullptr,nullptr);
-            CreateWindowA("STATIC", "Port", WS_CHILD|WS_VISIBLE, 150,8,30,20,h,nullptr,nullptr,nullptr);
-            g_app.ePort=CreateWindowA("EDIT", "5050", WS_CHILD|WS_VISIBLE|WS_BORDER, 182,8,55,20,h,nullptr,nullptr,nullptr);
-            CreateWindowA("STATIC", "Room", WS_CHILD|WS_VISIBLE, 242,8,35,20,h,nullptr,nullptr,nullptr);
-            g_app.eRoom=CreateWindowA("EDIT", "main", WS_CHILD|WS_VISIBLE|WS_BORDER, 280,8,90,20,h,nullptr,nullptr,nullptr);
-            CreateWindowA("STATIC", "Pass", WS_CHILD|WS_VISIBLE, 375,8,35,20,h,nullptr,nullptr,nullptr);
-            g_app.ePass=CreateWindowA("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 412,8,90,20,h,nullptr,nullptr,nullptr);
-            CreateWindowA("BUTTON", "Join", WS_CHILD|WS_VISIBLE, 510,8,55,22,h,(HMENU)1,nullptr,nullptr);
-            CreateWindowA("BUTTON", "Create", WS_CHILD|WS_VISIBLE, 570,8,60,22,h,(HMENU)2,nullptr,nullptr);
-            CreateWindowA("BUTTON", "Clear", WS_CHILD|WS_VISIBLE, 635,8,55,22,h,(HMENU)3,nullptr,nullptr);
-            g_app.lbl=CreateWindowA("STATIC", "Not connected", WS_CHILD|WS_VISIBLE, 8,35,700,20,h,nullptr,nullptr,nullptr);
             g_app.hwnd = h;
+            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+            auto mk = [&](const char* cls, const char* txt, DWORD style, int x, int y, int w, int h, int id=0) {
+                HWND hw = CreateWindowA(cls, txt, style, x, y, w, h, g_app.hwnd, (HMENU)(INT_PTR)id, nullptr, nullptr);
+                SendMessage(hw, WM_SETFONT, (WPARAM)font, TRUE);
+                return hw;
+            };
+
+            mk("STATIC", "Host", WS_CHILD|WS_VISIBLE, 10,10,35,20);
+            g_app.eHost = mk("EDIT", "127.0.0.1", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 50,8,120,22, ID_HOST);
+            mk("STATIC", "Port", WS_CHILD|WS_VISIBLE, 180,10,30,20);
+            g_app.ePort = mk("EDIT", "5050", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 214,8,65,22, ID_PORT);
+            mk("STATIC", "Room", WS_CHILD|WS_VISIBLE, 290,10,35,20);
+            g_app.eRoom = mk("EDIT", "main", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 328,8,110,22, ID_ROOM);
+            mk("STATIC", "Password", WS_CHILD|WS_VISIBLE, 446,10,58,20);
+            g_app.ePass = mk("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_PASSWORD|ES_AUTOHSCROLL, 507,8,100,22, ID_PASS);
+
+            mk("BUTTON", "Join Room", WS_CHILD|WS_VISIBLE, 620,8,90,24, ID_JOIN);
+            mk("BUTTON", "Create Room", WS_CHILD|WS_VISIBLE, 715,8,98,24, ID_CREATE);
+            mk("BUTTON", "Clear Room", WS_CHILD|WS_VISIBLE, 620,38,90,24, ID_CLEAR);
+            g_app.btnPen = mk("BUTTON", "Pen: #", WS_CHILD|WS_VISIBLE, 715,38,98,24, ID_PEN);
+
+            g_app.lblStatus = mk("STATIC", "Status: Not connected", WS_CHILD|WS_VISIBLE, 10,40,600,20, ID_STATUS);
+            g_app.lblRoom = mk("STATIC", "Active Room: none", WS_CHILD|WS_VISIBLE, 10,62,600,20, ID_ACTIVE_ROOM);
+
             return 0;
         }
         case WM_COMMAND: {
-            if (LOWORD(w)==1) clientConnectAndJoin(false);
-            if (LOWORD(w)==2) clientConnectAndJoin(true);
-            if (LOWORD(w)==3 && g_app.connected) sendLine(g_app.sock, "CLEAR");
+            switch (LOWORD(w)) {
+                case ID_JOIN: clientConnectAndRoom(false); break;
+                case ID_CREATE: clientConnectAndRoom(true); break;
+                case ID_CLEAR: if (g_app.connected) sendLine(g_app.sock, "CLEAR"); break;
+                case ID_PEN:
+                    g_app.pen = (g_app.pen == '#') ? '@' : '#';
+                    SetWindowTextA(g_app.btnPen, (g_app.pen == '#') ? "Pen: #" : "Pen: @");
+                    break;
+            }
             return 0;
         }
         case WM_LBUTTONDOWN:
         case WM_MOUSEMOVE: {
-            if (!(w & MK_LBUTTON) && m == WM_MOUSEMOVE) return 0;
-            int x = LOWORD(l)/CELL;
-            int y = (HIWORD(l)-80)/CELL;
-            if (x>=0 && x<BOARD_W && y>=0 && y<BOARD_H) {
-                cx=x; cy=y;
-                if (g_app.connected) sendLine(g_app.sock, "DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1,g_app.pen));
-                InvalidateRect(h,nullptr,FALSE);
+            if (m == WM_MOUSEMOVE && !(w & MK_LBUTTON)) return 0;
+            int px = GET_X_LPARAM(l) - 8;
+            int py = GET_Y_LPARAM(l) - TOOLBAR_H;
+            int x = px / CELL;
+            int y = py / CELL;
+            if (x >= 0 && x < BOARD_W && y >= 0 && y < BOARD_H && g_app.connected) {
+                sendLine(g_app.sock, "DRAW " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(1, g_app.pen));
             }
             return 0;
         }
+        case WM_KEYDOWN:
+            if (w == 'P') {
+                g_app.pen = (g_app.pen == '#') ? '@' : '#';
+                SetWindowTextA(g_app.btnPen, (g_app.pen == '#') ? "Pen: #" : "Pen: @");
+            }
+            return 0;
         case WM_NET_LINE: {
             std::unique_ptr<std::string> line((std::string*)l);
-            std::stringstream ss(*line); std::string head; ss>>head;
-            if (head=="ROOM") { std::string mode; ss>>g_app.room>>mode; setStatus("Joined " + g_app.room + " (" + mode + ")"); }
-            else if (head=="STATE") { std::string payload; std::getline(ss,payload); g_app.board = boardFromWire(trim(payload)); InvalidateRect(h,nullptr,FALSE); }
-            else if (head=="EVENT") {
-                std::string k; ss>>k;
-                if (k=="DRAW") { int x,y; char ch; ss>>x>>y>>ch; if(x>=0&&x<BOARD_W&&y>=0&&y<BOARD_H) g_app.board[y][x]=ch; }
-                if (k=="CLEAR") g_app.board.assign(BOARD_H, std::string(BOARD_W,'.'));
-                InvalidateRect(h,nullptr,FALSE);
-            } else if (head=="ERROR") { std::string msg; std::getline(ss,msg); setStatus(trim(msg)); }
+            std::stringstream ss(*line);
+            std::string head;
+            ss >> head;
+            if (head == "ROOM") {
+                std::string room, mode; ss >> room >> mode;
+                setActiveRoom(room, mode);
+                setStatus("Status: Connected");
+            } else if (head == "STATE") {
+                std::string payload; std::getline(ss, payload);
+                g_app.board = boardFromWire(trim(payload));
+                InvalidateRect(h, nullptr, FALSE);
+            } else if (head == "EVENT") {
+                std::string kind; ss >> kind;
+                if (kind == "DRAW") {
+                    int x, y; char c; ss >> x >> y >> c;
+                    if (x>=0 && x<BOARD_W && y>=0 && y<BOARD_H) g_app.board[y][x] = c;
+                } else if (kind == "CLEAR") {
+                    g_app.board.assign(BOARD_H, std::string(BOARD_W, '.'));
+                }
+                InvalidateRect(h, nullptr, FALSE);
+            } else if (head == "ERROR") {
+                std::string msg; std::getline(ss, msg);
+                setStatus("Status: " + trim(msg));
+            }
             return 0;
         }
-        case WM_KEYDOWN:
-            if (w=='P') g_app.pen=(g_app.pen=='#'?'@':'#');
-            return 0;
         case WM_PAINT: {
-            PAINTSTRUCT ps; HDC hdc = BeginPaint(h,&ps);
-            for (int y=0;y<BOARD_H;++y) for(int x=0;x<BOARD_W;++x) drawCell(hdc,x,y,g_app.board[y][x],x==cx&&y==cy);
-            EndPaint(h,&ps); return 0;
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(h, &ps);
+            RECT rc; GetClientRect(h, &rc);
+
+            HBRUSH top = CreateSolidBrush(RGB(240, 244, 252));
+            RECT bar{0,0,rc.right,TOOLBAR_H};
+            FillRect(hdc, &bar, top);
+            DeleteObject(top);
+
+            drawBoard(hdc, rc);
+            EndPaint(h, &ps);
+            return 0;
         }
         case WM_DESTROY:
-            g_app.connected=false;
-            if (g_app.sock != INVALID_SOCKET) closesocket(g_app.sock);
-            if (g_app.reader.joinable()) g_app.reader.join();
-            PostQuitMessage(0); return 0;
+            closeClientConnection();
+            PostQuitMessage(0);
+            return 0;
     }
-    return DefWindowProc(h,m,w,l);
+    return DefWindowProc(h, m, w, l);
 }
 
 } // namespace
 
 int APIENTRY WinMain(HINSTANCE hi, HINSTANCE, LPSTR cmd, int show) {
-    WSADATA w; if (WSAStartup(MAKEWORD(2,2), &w) != 0) return 1;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return 1;
 
     std::string args = cmd ? cmd : "";
+    int port = 5050;
+    auto ppos = args.find("--port ");
+    if (ppos != std::string::npos) {
+        port = atoi(args.c_str() + ppos + 7);
+        if (port <= 0) port = 5050;
+    }
+
     if (args.find("--server") != std::string::npos) {
-        int code = runServer(5050);
+        int code = runServer(port);
         WSACleanup();
         return code;
     }
 
-    WNDCLASSA wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=hi; wc.lpszClassName="SharedWhiteboardUI";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hi;
+    wc.lpszClassName = "SharedWhiteboardWindow";
+    wc.hCursor = LoadCursor(nullptr, IDC_CROSS);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassA(&wc);
 
-    HWND hwnd = CreateWindowA("SharedWhiteboardUI","Shared Whiteboard (Windows App)",WS_OVERLAPPEDWINDOW,
-        100,100,860,430,nullptr,nullptr,hi,nullptr);
+    HWND hwnd = CreateWindowA("SharedWhiteboardWindow", "Shared Whiteboard - Windows App",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80, 60, 1040, 760,
+        nullptr, nullptr, hi, nullptr);
+
     ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
 
     MSG msg;
-    while (GetMessage(&msg,nullptr,0,0)) {
+    while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+
     WSACleanup();
     return 0;
 }
@@ -348,7 +472,7 @@ int APIENTRY WinMain(HINSTANCE hi, HINSTANCE, LPSTR cmd, int show) {
 #else
 #include <iostream>
 int main() {
-    std::cout << "This project targets Windows GUI build only. Build SharedWhiteboard.exe on Windows.\n";
+    std::cout << "This project is a Windows GUI app. Build and run on Windows.\n";
     return 0;
 }
 #endif

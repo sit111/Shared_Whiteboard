@@ -1,30 +1,35 @@
 # Shared Whiteboard (Windows GUI App, Single `.exe`)
 
-You were right: now this is a **real Windows app window**, not terminal UI.
+Now this is a proper **Windows desktop GUI** (not terminal) with improved layout and working room controls.
 
-## What opens now
-- A GUI window with:
-  - Host / Port / Room / Password fields
-  - **Join**, **Create**, **Clear** buttons
-  - Click-and-draw board area
-- Press `P` to change pen (`#` / `@`).
+## What is fixed
+- Better UI design (toolbar + larger drawing area)
+- Room actions are explicit and usable from buttons:
+  - **Join Room**
+  - **Create Room**
+- Password and no-password rooms both supported from the same UI
+- Clear room button works for the active room
 
 ## Run server
 ```bat
-SharedWhiteboard.exe --server
+SharedWhiteboard.exe --server --port 5050
 ```
-(Hosts on port `5050`.)
 
-## Run client app window
+## Run client GUI
 ```bat
 SharedWhiteboard.exe
 ```
-Then use Join/Create in the window.
 
-## Rooms with and without password
-- Create open room: leave Password empty + click **Create**
-- Create locked room: set Password + click **Create**
-- Join locked room: enter same Password + click **Join**
+In the window:
+1. Set Host/Port
+2. Enter Room and optional Password
+3. Click **Create Room** (new room) or **Join Room** (existing room)
+4. Draw with mouse drag
+
+## Controls
+- Mouse drag: draw
+- **Clear Room** button: clear active room
+- **Pen** button or key `P`: switch pen `#`/`@`
 
 ## Build on Windows (MinGW-w64)
 ```bat
